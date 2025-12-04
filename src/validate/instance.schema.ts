@@ -44,6 +44,10 @@ export const instanceSchema: JSONSchema7 = {
     readStatus: { type: 'boolean' },
     syncFullHistory: { type: 'boolean' },
     wavoipToken: { type: 'string' },
+    ignoreList: { type: 'array' },
+    mediaTypes: { type: 'array' },
+    initialConnection: { type: 'string', format: 'date-time' },
+
     // Proxy
     proxyHost: { type: 'string' },
     proxyPort: { type: 'string' },

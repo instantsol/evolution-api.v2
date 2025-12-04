@@ -87,6 +87,9 @@ export declare namespace wa {
     readStatus?: boolean;
     syncFullHistory?: boolean;
     wavoipToken?: string;
+    ignoreList?: string[];
+    mediaTypes?: string[];
+    initialConnection?: Date;
   };
 
   export type LocalEvent = {

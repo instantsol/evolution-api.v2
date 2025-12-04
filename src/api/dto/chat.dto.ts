@@ -61,7 +61,7 @@ export class ProfilePictureDto {
   picture?: string;
 }
 
-class Key {
+export class Key {
   id: string;
   fromMe: boolean;
   remoteJid: string;

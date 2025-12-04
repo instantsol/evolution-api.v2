@@ -7,4 +7,7 @@ export class SettingsDto {
   readStatus?: boolean;
   syncFullHistory?: boolean;
   wavoipToken?: string;
+  ignoreList?: string[];
+  mediaTypes?: string[];
+  initialConnection?: Date;
 }
