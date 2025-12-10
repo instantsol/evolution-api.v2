@@ -18,6 +18,10 @@ def convert_bytes(obj):
         return base64.b64encode(obj).decode("utf-8")
     raise TypeError(f"Tipo não serializável: {type(obj)}")
 
+WEBHOOK_EVENTS = ["QRCODE_UPDATED", "MESSAGES_UPSERT", "MESSAGES_UPDATE", "MESSAGES_DELETE",
+                  "CONTACTS_UPDATE", "CHATS_UPSERT", "CHATS_UPDATE", "CHATS_DELETE", "GROUPS_UPSERT", "GROUP_UPDATE", "CONNECTION_UPDATE"] 
+WEBHOOK_URL = os.getenv('WEBHOOK')
+
 def migrate():
 
 
@@ -47,6 +51,7 @@ def migrate():
     curr.execute('delete from "Setting"')
     curr.execute('delete from "Message"')
     curr.execute('delete from "Chat"')
+    curr.execute('delete from "Webhook"')
     
     for instance in mongo_authentication.find(
       #{'instanceId': 'd5260865-787a-4cda-afd3-4f8ec3651804'}
@@ -65,16 +70,20 @@ def migrate():
       
       # Create session
       mongo_instance = client['evolution-instances'][instance['_id']].find_one({'_id': 'creds'})
+      mongo_instance.pop('_id', '')
+      session_data = json.dumps(json.dumps(mongo_instance)).replace(' ', '')
       curr.execute("""
                    INSERT INTO "Session" (id, "sessionId", creds, "createdAt") VALUES (%s, %s, %s, NOW())
-                   """, tuple([instance['instanceId'], instance['instanceId'], json.dumps(mongo_instance)]))
+                   """, tuple([instance['instanceId'], instance['instanceId'], session_data]))
       # Get contacts
       mongo_contacts = [contact for contact in db["contacts"].find({"owner": instance['_id']})]
-      contact_list = {f"{contact['id']}_{instance['instanceId']}":tuple([f"{index}-{instance['instanceId']}", contact['id'], contact.get('pushName') or '', contact['profilePictureUrl'], instance['instanceId']]) 
+      contact_list = {f"{contact['id']}_{instance['instanceId']}":tuple([f"{index}-{instance['instanceId']}", 
+                          contact['id'], contact.get('pushName') or '', contact['profilePictureUrl'], instance['instanceId'],
+                          contact.get('kwik_contact_id'), contact.get('kwik_contact_name')]) 
                       for index, contact in enumerate(mongo_contacts) if contact['id'] is not None}
       curr.executemany("""
-                       INSERT INTO "Contact" (id, "remoteJid", "pushName", "profilePicUrl", "updatedAt", "instanceId")
-                       VALUES (%s, %s, %s, %s, NOW(), %s)
+                       INSERT INTO "Contact" (id, "remoteJid", "pushName", "profilePicUrl", "updatedAt", "instanceId", kwik_contact_id, kwik_contact_name)
+                       VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)
                        """, tuple(contact_list.values()))
       # Get Settings
       mongo_settings = db["settings"].find_one({'_id': instance['_id']})
@@ -91,10 +100,10 @@ def migrate():
                    "rejectCall", "msgCall", "groupsIgnore", 
                    "alwaysOnline", "readMessages", "readStatus", "syncFullHistory", 
                    "createdAt", "updatedAt", "instanceId", "ignoreList",
-                   "initialConnection", "mediaTypes") 
+                   "initialConnection", "mediaTypes", "wavoipToken") 
                    VALUES (%s, %s, 
                    %s, %s, %s, %s, %s, %s, 
-                   NOW(), NOW(), %s, %s, %s, %s)
+                   NOW(), NOW(), %s, %s, %s, %s, '')
                    """, settings)      
       # Get messages
       mongo_messages = [message for message in db["messages"].find({"owner": instance['_id']})]
@@ -109,6 +118,10 @@ def migrate():
                        INSERT INTO "Message" (id, "key", "pushName", "messageType", "message", "source", "messageTimestamp", "instanceId")
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                        """, tuple(message_list))
+
+      curr.execute("""INSERT INTO "Webhook" (id, url, enabled, events, "webhookByEvents", "webhookBase64", "updatedAt", "instanceId")
+                   VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)""", tuple([instance['instanceId'], WEBHOOK_URL, True, json.dumps(WEBHOOK_EVENTS),
+                                                                      False, True, instance['instanceId']]))
 
       postgresql.commit()
 
