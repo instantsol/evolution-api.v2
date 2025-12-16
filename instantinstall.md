@@ -1,5 +1,5 @@
 #python tem que ser 3.13
-# 1.  Download from https://github.com/EvolutionAPI/evolution-api.git .
+# 1.  Download from https://github.com/instantsol/evolution-api.v2.git .
 # 2.  Download manager from https://github.com/EvolutionAPI/evolution-manager-v2/ or the right tree ( check on the evolution-api main branch)
 # 3.  Install postgresql (sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm sudo dnf install -y postgresql15 postgresql15-server postgresql-devel python3.13-devel)
 # 4.  Create postgresql user / superuser/ grant permissions / change login mode (pg_hba.conf//var/lib/pgsql/data/pg_hba.conf -> change method from ident/perr to md5)
