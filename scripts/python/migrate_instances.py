@@ -70,11 +70,12 @@ def migrate():
       
       # Create session
       mongo_instance = client['evolution-instances'][instance['_id']].find_one({'_id': 'creds'})
-      mongo_instance.pop('_id', '')
-      session_data = json.dumps(json.dumps(mongo_instance)).replace(' ', '')
-      curr.execute("""
-                   INSERT INTO "Session" (id, "sessionId", creds, "createdAt") VALUES (%s, %s, %s, NOW())
-                   """, tuple([instance['instanceId'], instance['instanceId'], session_data]))
+      if mongo_instance:
+        mongo_instance.pop('_id', '')
+        session_data = json.dumps(json.dumps(mongo_instance)).replace(' ', '')
+        curr.execute("""
+                     INSERT INTO "Session" (id, "sessionId", creds, "createdAt") VALUES (%s, %s, %s, NOW())
+                     """, tuple([instance['instanceId'], instance['instanceId'], session_data]))
       # Get contacts
       mongo_contacts = [contact for contact in db["contacts"].find({"owner": instance['_id']})]
       contact_list = {f"{contact['id']}_{instance['instanceId']}":tuple([f"{index}-{instance['instanceId']}", 
