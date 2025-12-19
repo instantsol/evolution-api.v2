@@ -786,6 +786,7 @@ view  ContactWithLastMessage {
   fromme                 String?
   kwik_contact_id        String?  
   kwik_contact_name      String?
+  instancename           String?
   
   @@map("contact_with_last_message")
 }

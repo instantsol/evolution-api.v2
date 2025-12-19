@@ -13,8 +13,11 @@ async function main() {
             m.message AS message,
             m."messageTimestamp" as lastmessagetimestamp,
             m."messageType" as messagetype,
-            (m.key->>'fromMe') AS fromme
+            (m.key->>'fromMe') AS fromme,
+            i.name AS instancename
       FROM "Contact" c
+      INNER JOIN "Instance" i on
+      i.id = c."instanceId"
       LEFT JOIN LATERAL (
         SELECT *
         FROM "Message" m
