@@ -82,7 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import {makeProxyAgent, makeProxyAgentUndici} from '@utils/makeProxyAgent';
+import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -261,7 +261,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
-    this.messageProcessor.onDestroy();
+    //this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
@@ -873,10 +873,17 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
-      const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
+      const contactsRaw: {
+        id: string;
+        remoteJid: string;
+        pushName?: string;
+        profilePicUrl?: string;
+        instanceId: string;
+      }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
         contactsRaw.push({
+          id: contact.id,
           remoteJid: contact.id,
           pushName: contact?.name ?? contact?.verifiedName,
           profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
@@ -924,8 +931,12 @@ export class BaileysStartupService extends ChannelStartupService {
         );
 
         const instance: InstanceDto = { instanceName: this.instance.name };
-
-        let timestampLimitToImport = null;
+        const instanceObject = await this.prismaRepository.instance.findFirst({ where: { name: this.instance.name } });
+        const settings = await this.prismaRepository.setting.findFirst({ where: { instanceId: instanceObject.id } });
+        const timestampLimit = instanceObject.disconnectionAt
+          ? instanceObject.disconnectionAt
+          : settings.initialConnection;
+        let timestampLimitToImport = Math.floor(timestampLimit.getTime() / 1000);
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
           const daysLimitToImport = this.localChatwoot?.enabled ? this.localChatwoot.daysLimitImportMessages : 1000;
@@ -999,12 +1010,12 @@ export class BaileysStartupService extends ChannelStartupService {
           if (Long.isLong(m?.messageTimestamp)) {
             m.messageTimestamp = m.messageTimestamp?.toNumber();
           }
-
-          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-            if (m.messageTimestamp <= timestampLimitToImport) {
-              continue;
-            }
+          if (m.messageTimestamp <= timestampLimitToImport) {
+            continue;
           }
+          // if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+
+          // }
 
           if (messagesRepository?.has(m.key.id)) {
             continue;
@@ -1057,7 +1068,12 @@ export class BaileysStartupService extends ChannelStartupService {
       settings: any,
     ) => {
       try {
+        const ignoreList = new Set(settings.ignoreList);
         for (const received of messages) {
+          received.key.remoteJid =
+            received.key.remoteJidAlt && !received.key.remoteJidAlt.includes('@lid')
+              ? received.key.remoteJidAlt
+              : received.key.remoteJid;
           if (
             received?.messageStubParameters?.some?.((param) =>
               [
@@ -1074,6 +1090,12 @@ export class BaileysStartupService extends ChannelStartupService {
             this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
             continue;
           }
+
+          if (ignoreList.has(received.key.remoteJid) || ignoreList.has(received.key.remoteJidAlt)) {
+            this.logger.warn(`Message ignored with ignoreList: ${JSON.stringify(received, null, 2)}`);
+            continue;
+          }
+
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
             const text = received.message?.conversation || received.message?.extendedTextMessage?.text;
 
@@ -1109,13 +1131,20 @@ export class BaileysStartupService extends ChannelStartupService {
                 ? Math.floor(received?.messageTimestamp.toNumber())
                 : Math.floor(received?.messageTimestamp as number);
 
-              await this.prismaRepository.message.update({
-                where: { id: (oldMessage as any).id },
-                data: {
-                  message: editedMessage.editedMessage as any,
-                  messageTimestamp: editedMessageTimestamp,
-                  status: 'EDITED',
+              const { id, ...rawOldMessage } = oldMessage as any;
+              const rawMessage = {
+                ...(rawOldMessage as any),
+                messageType: 'editedMessage',
+                message: {
+                  ...(editedMessage.editedMessage as any),
+                  protocolMessage: { key: { id: (rawOldMessage as any).key.id, oldid: id } },
                 },
+                messageTimestamp: editedMessageTimestamp,
+                status: 'EDITED',
+              };
+              await this.prismaRepository.message.create({
+                //where: { id: (oldMessage as any).id },
+                data: rawMessage,
               });
               await this.prismaRepository.messageUpdate.create({
                 data: {
@@ -1127,6 +1156,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   messageId: (oldMessage as any).id,
                 },
               });
+              this.sendDataWebhook(Events.MESSAGES_UPSERT, rawMessage);
             }
           }
 
@@ -1359,18 +1389,23 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
+          const jidList = [received.key.remoteJid, received.key.remoteJidAlt].filter((jid) => jid);
           const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            where: { remoteJid: { in: jidList }, instanceId: this.instanceId },
           });
-
           const contactRaw: {
+            id: string;
             remoteJid: string;
             pushName: string;
             profilePicUrl?: string;
             instanceId: string;
           } = {
+            id: received.key.remoteJid,
             remoteJid: received.key.remoteJid,
-            pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
+            pushName:
+              (received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName) ||
+              contact?.pushName ||
+              '',
             profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
@@ -1401,7 +1436,10 @@ export class BaileysStartupService extends ChannelStartupService {
               );
             }
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+            if (
+              this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS &&
+              !contactRaw.remoteJid.includes('@g.us')
+            )
               await this.prismaRepository.contact.upsert({
                 where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
                 create: contactRaw,
@@ -1584,10 +1622,18 @@ export class BaileysStartupService extends ChannelStartupService {
     'groups.update': (groupMetadataUpdate: Partial<GroupMetadata>[]) => {
       this.sendDataWebhook(Events.GROUPS_UPDATE, groupMetadataUpdate);
 
-      groupMetadataUpdate.forEach((group) => {
+      groupMetadataUpdate.map((group) => {
         if (isJidGroup(group.id)) {
           this.updateGroupMetadataCache(group.id);
         }
+
+        const updateContact = async () => {
+          await this.prismaRepository.contact.updateMany({
+            where: { remoteJid: group.id, instanceId: this.instanceId },
+            data: { pushName: group.subject },
+          });
+        };
+        updateContact();
       });
     },
 
@@ -3616,9 +3662,15 @@ export class BaileysStartupService extends ChannelStartupService {
           if (isLogicalDeleted) {
             if (!message) return response;
             const existingKey = typeof message?.key === 'object' && message.key !== null ? message.key : {};
-            message = await this.prismaRepository.message.update({
-              where: { id: message.id },
-              data: { key: { ...existingKey, deleted: true }, status: 'DELETED' },
+            message = await this.prismaRepository.message.create({
+              //where: { id: message.id },
+              data: {
+                ...message,
+                messageType: 'protocolMessage',
+                message: { ...(message.message as any), protocolMessage: { key: { id: (existingKey as any).id } } },
+                key: { ...existingKey, deleted: true },
+                status: 'DELETED',
+              },
             });
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
               const messageUpdate: any = {
@@ -4046,9 +4098,10 @@ export class BaileysStartupService extends ChannelStartupService {
             } else {
               oldMessage.message[oldMessage.messageType].caption = data.text;
             }
-            message = await this.prismaRepository.message.update({
-              where: { id: message.id },
+            message = await this.prismaRepository.message.create({
+              //where: { id: message.id },
               data: {
+                ...message,
                 message: oldMessage.message,
                 status: 'EDITED',
                 messageTimestamp: Math.floor(Date.now() / 1000), // Convert to int32 by dividing by 1000 to get seconds

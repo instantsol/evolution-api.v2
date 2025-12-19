@@ -6,7 +6,7 @@ export class SettingsController {
   constructor(private readonly settingsService: SettingsService) {}
 
   public async createSettings(instance: InstanceDto, data: SettingsDto) {
-    return this.settingsService.create(instance, data);
+    return await this.settingsService.create(instance, data);
   }
 
   public async findSettings(instance: InstanceDto) {

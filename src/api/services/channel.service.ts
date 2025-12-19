@@ -153,6 +153,9 @@ export class ChannelStartupService {
     this.localSettings.readStatus = data?.readStatus;
     this.localSettings.syncFullHistory = data?.syncFullHistory;
     this.localSettings.wavoipToken = data?.wavoipToken;
+    this.localSettings.ignoreList = data?.ignoreList;
+    this.localSettings.mediaTypes = data?.mediaTypes;
+    this.localSettings.initialConnection = data?.initialConnection;
   }
 
   public async setSettings(data: SettingsDto) {
@@ -169,6 +172,9 @@ export class ChannelStartupService {
         readStatus: data.readStatus,
         syncFullHistory: data.syncFullHistory,
         wavoipToken: data.wavoipToken,
+        ignoreList: data.ignoreList,
+        mediaTypes: data.mediaTypes,
+        initialConnection: data.initialConnection,
       },
       create: {
         rejectCall: data.rejectCall,
@@ -180,6 +186,9 @@ export class ChannelStartupService {
         syncFullHistory: data.syncFullHistory,
         wavoipToken: data.wavoipToken,
         instanceId: this.instanceId,
+        ignoreList: data.ignoreList,
+        mediaTypes: data.mediaTypes,
+        initialConnection: new Date(),
       },
     });
 
@@ -191,6 +200,9 @@ export class ChannelStartupService {
     this.localSettings.readStatus = data?.readStatus;
     this.localSettings.syncFullHistory = data?.syncFullHistory;
     this.localSettings.wavoipToken = data?.wavoipToken;
+    this.localSettings.ignoreList = data?.ignoreList;
+    this.localSettings.mediaTypes = data?.mediaTypes;
+    this.localSettings.initialConnection = data?.initialConnection;
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       this.client.ws.close();
@@ -218,6 +230,9 @@ export class ChannelStartupService {
       readStatus: data.readStatus,
       syncFullHistory: data.syncFullHistory,
       wavoipToken: data.wavoipToken,
+      ignoreList: data.ignoreList,
+      mediaTypes: data.mediaTypes,
+      initialConnection: data.initialConnection,
     };
   }
 

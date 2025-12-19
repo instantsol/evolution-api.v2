@@ -123,6 +123,9 @@ export class InstanceController {
         readStatus: instanceData.readStatus === true,
         syncFullHistory: instanceData.syncFullHistory === true,
         wavoipToken: instanceData.wavoipToken || '',
+        ignoreList: instanceData.ignoreList || [],
+        mediaTypes: instanceData.mediaTypes || ['all'],
+        initialConnection: instanceData.initialConnection,
       };
 
       await this.settingsService.create(instance, settings);
@@ -344,6 +347,7 @@ export class InstanceController {
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
         this.logger.info('restarting instance' + instanceName);
 
+        console.log('closing websocket', instanceName);
         instance.client?.ws?.close();
         instance.client?.end(new Error('restart'));
         return await this.connectToWhatsapp({ instanceName });

@@ -57,12 +57,25 @@ export class InstanceRouter extends RouterBroker {
       .get(this.routerPath('fetchInstances', false), ...guards, async (req, res) => {
         const key = req.get('apikey');
 
+        //const fullFetch = req.query.fullFetch ? Number(req.query.fullFetch) : 0;
+        //const messageTimestamp = req.query.messageTimestamp ? req.query.messageTimestamp : -1;
+
         const response = await this.dataValidate<InstanceDto>({
           request: req,
           schema: null,
           ClassRef: InstanceDto,
           execute: (instance) => instanceController.fetchInstances(instance, key),
         });
+
+        // if (fullFetch > 0) { # TODO
+        //   const usageData = await this.dataValidate<InstanceDto>({
+        //     request: req,
+        //     schema: null,
+        //     ClassRef: InstanceDto,
+        //     execute: (instance) => kwikController.instanceInfo(instance, Number(messageTimestamp), fullFetch),
+        //   });
+        //   response.usageData = usageData;
+        // }
 
         return res.status(HttpStatus.OK).json(response);
       })

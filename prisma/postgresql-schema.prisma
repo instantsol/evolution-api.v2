@@ -6,6 +6,7 @@
 
 generator client {
   provider = "prisma-client-js"
+  previewFeatures = ["views"]
 }
 
 datasource db {
@@ -145,6 +146,8 @@ model Contact {
   updatedAt     DateTime? @updatedAt @db.Timestamp
   Instance      Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId    String
+  kwik_contact_id String?  @db.VarChar(255)
+  kwik_contact_name String? @db.VarChar(255)
 
   @@unique([remoteJid, instanceId])
   @@index([remoteJid])
@@ -172,6 +175,12 @@ model Message {
   Media                        Media?
   webhookUrl                   String?         @db.VarChar(500)
   status                       String?         @db.VarChar(30)
+  transcription                String?         @db.VarChar(5000)        
+  transcription_status         String?         @db.VarChar(100)
+  transcription_error          String?         @db.VarChar(5000)
+  restricted                   Boolean?        @default(false) @db.Boolean
+  restricted_word              String?         @db.VarChar(500)
+  restricted_group             String?         @db.VarChar(500)
 
   sessionId String?
   session   IntegrationSession? @relation(fields: [sessionId], references: [id])
@@ -275,10 +284,14 @@ model Setting {
   readStatus      Boolean   @default(false) @db.Boolean
   syncFullHistory Boolean   @default(false) @db.Boolean
   wavoipToken     String?   @db.VarChar(100)
+  ignoreList      String[] 
+  mediaTypes      String[] 
+  initialConnection DateTime @default(now()) @db.Timestamp
   createdAt       DateTime? @default(now()) @db.Timestamp
   updatedAt       DateTime  @updatedAt @db.Timestamp
   Instance        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId      String    @unique
+  totalSize       Int?      @default(0)
 
   @@index([instanceId])
 }
@@ -759,4 +772,37 @@ model EvoaiSetting {
   evoaiIdFallback String?   @db.VarChar(100)
   Instance        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId      String    @unique
+}
+
+view  ContactWithLastMessage {
+  id                     String
+  remoteJid              String
+  pushName               String?
+  profilePicUrl          String?
+  instanceId             String
+  message                Json?
+  lastmessagetimestamp   Int?
+  messagetype            String?
+  fromme                 String?
+  kwik_contact_id        String?  
+  kwik_contact_name      String?
+  
+  @@map("contact_with_last_message")
+}
+
+view MessageWithRemoteJid {
+  id                           String          
+  key                          Json            
+  pushName                     String?         
+  participant                  String?         
+  messageType                  String          
+  message                      Json            
+  contextInfo                  Json?     
+  messageTimestamp             Int?
+  remotejid                    String
+  instanceId                   String?
+  text                         String?
+  messageid                    String? 
+
+  @@map("message_with_remotejid")
 }
