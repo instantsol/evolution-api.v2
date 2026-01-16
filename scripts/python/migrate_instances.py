@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import psycopg2
 import json
 import base64
+import sys
 
 load_dotenv()
 
@@ -45,18 +46,25 @@ def migrate():
   with postgresql.cursor() as curr:
     # Executar consulta
     curr.execute("SET search_path TO evolution_api;")
-    curr.execute('delete from "Instance"')
-    curr.execute('delete from "Session"')
-    curr.execute('delete from "Contact"')
-    curr.execute('delete from "Setting"')
-    curr.execute('delete from "Message"')
-    curr.execute('delete from "Chat"')
-    curr.execute('delete from "Webhook"')
+    #curr.execute('delete from "Instance"')
+    #curr.execute('delete from "Session"')
+    #curr.execute('delete from "Contact"')
+    #curr.execute('delete from "Setting"')
+    #curr.execute('delete from "Message"')
+    #curr.execute('delete from "Chat"')
+    #curr.execute('delete from "Webhook"')
     
+    curr.execute('select name from "Instance"')
+    ignorelist = set([each[0] for each in curr.fetchall()])
+
     for instance in mongo_authentication.find(
+      #{'_id': 'isacr00123_5511952970249'}
       #{'instanceId': 'd5260865-787a-4cda-afd3-4f8ec3651804'}
       ):
       #integration = db["integration"].find_one({'_id': instance['_id']})
+      if instance['_id'] in ignorelist:
+        print('ignoring ', instance['_id'])
+        continue
       try:
         accountcode, phone_number = instance['_id'].split('_')
       except:
@@ -106,19 +114,55 @@ def migrate():
                    %s, %s, %s, %s, %s, %s, 
                    NOW(), NOW(), %s, %s, %s, %s, '')
                    """, settings)      
-      # Get messages
-      mongo_messages = [message for message in db["messages"].find({"owner": instance['_id']})]
-      message_list = [tuple([
-        f"{index}-{instance['instanceId']}",
-        json.dumps(message['key']), 
-        message.get('pushName') or '', message['messageType'], json.dumps(message['message'], default=convert_bytes), 'web',
-        message['messageTimestamp'], instance['instanceId'], 
-        ]) for index, message in enumerate(mongo_messages)]
+      # # Get messages
+      # mongo_messages = [message for message in db["messages"].find({"owner": instance['_id']})]
+      # message_list = [tuple([
+      #   f"{index}-{instance['instanceId']}",
+      #   json.dumps(message['key']), 
+      #   message.get('pushName') or '', message['messageType'], json.dumps(message['message'], default=convert_bytes), 'web',
+      #   message['messageTimestamp'], instance['instanceId'], 
+      #   ]) for index, message in enumerate(mongo_messages)]
 
-      curr.executemany("""
-                       INSERT INTO "Message" (id, "key", "pushName", "messageType", "message", "source", "messageTimestamp", "instanceId")
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                       """, tuple(message_list))
+      # curr.executemany("""
+      #                  INSERT INTO "Message" (id, "key", "pushName", "messageType", "message", "source", "messageTimestamp", "instanceId")
+      #                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+      #                  """, tuple(message_list))
+      
+      BATCH_SIZE = 1000
+
+      cursor = db["messages"].find({"owner": instance['_id']})
+
+      batch = []
+      index = 0
+
+      for message in cursor:
+          batch.append((
+              f"{index}-{instance['instanceId']}",
+              json.dumps(message['key']),
+              message.get('pushName') or '',
+              message['messageType'],
+              json.dumps(message['message'], default=convert_bytes).encode("utf-8", "replace").decode("utf-8"),
+              'web',
+              message['messageTimestamp'],
+              instance['instanceId'],
+          ))
+          index += 1
+
+          # When batch is full → insert into PostgreSQL
+          if len(batch) >= BATCH_SIZE:
+              curr.executemany("""
+                  INSERT INTO "Message" (id, "key", "pushName", "messageType", "message", "source", "messageTimestamp", "instanceId")
+                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+              """, batch)
+              batch.clear()
+
+      # Insert remaining rows
+      if batch:
+          curr.executemany("""
+              INSERT INTO "Message" (id, "key", "pushName", "messageType", "message", "source", "messageTimestamp", "instanceId")
+              VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+          """, batch)
+
 
       curr.execute("""INSERT INTO "Webhook" (id, url, enabled, events, "webhookByEvents", "webhookBase64", "updatedAt", "instanceId")
                    VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)""", tuple([instance['instanceId'], WEBHOOK_URL, True, json.dumps(WEBHOOK_EVENTS),

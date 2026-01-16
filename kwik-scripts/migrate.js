@@ -21,7 +21,7 @@ async function main() {
       LEFT JOIN LATERAL (
         SELECT *
         FROM "Message" m
-        WHERE (m.key->>'remoteJid') = c."remoteJid"
+        WHERE (m.key->>'remoteJid') = c."remoteJid" and "instanceId" = c."instanceId"
         ORDER BY "messageTimestamp" DESC
         LIMIT 1
       ) m ON TRUE

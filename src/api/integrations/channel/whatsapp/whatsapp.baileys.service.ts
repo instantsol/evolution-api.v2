@@ -874,7 +874,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
       const contactsRaw: {
-        id: string;
+        //id: string;
         remoteJid: string;
         pushName?: string;
         profilePicUrl?: string;
@@ -883,7 +883,7 @@ export class BaileysStartupService extends ChannelStartupService {
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
         contactsRaw.push({
-          id: contact.id,
+          //id: `${contact.id}`,
           remoteJid: contact.id,
           pushName: contact?.name ?? contact?.verifiedName,
           profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
@@ -1449,13 +1449,16 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
+          const { id, ...createContact } = contactRaw;
+          this.logger.info(id);
+
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.upsert({
               where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
               update: contactRaw,
-              create: contactRaw,
+              create: createContact,
             });
         }
       } catch (error) {

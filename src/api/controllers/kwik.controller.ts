@@ -466,8 +466,18 @@ export class KwikController {
   }
 
   public async fetchMessages({ instanceName }: InstanceDto, body: any) {
-    logger.info(instanceName);
-    const data = await this.prismaRepository.messageWithRemoteJid.findMany({ ...body });
+    const owner = body?.where?.owner;
+    const instance = await this.prismaRepository.instance.findFirst({ where: { name: owner || instanceName } });
+
+    const payload: any = {
+      ...body,
+      where: {
+        ...body.where,
+        instanceId: instance.id,
+      },
+    };
+
+    const data = await this.prismaRepository.messageWithRemoteJid.findMany({ ...payload });
 
     return data;
   }
