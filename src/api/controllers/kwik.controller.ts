@@ -302,14 +302,14 @@ export class KwikController {
       const groupJid = g.split('#')[1];
       const group = await this.waMonitor.waInstances[instanceName].findGroup({ groupJid }, 'inner');
 
-      return group ? { ...group, instanceName } : null;
+      return group ? { ...group, instanceId: instanceId, instanceName } : null;
     });
 
     const [...contacts_solved] = await Promise.all([...contacts_promises]);
     const [...groups_solved] = await Promise.all([...groups_promises]);
 
     const contacts = Object.fromEntries(
-      contacts_solved.filter((c) => c != null).map((c) => [`${c.instanceId}#${c.id}`, c]),
+      contacts_solved.filter((c) => c != null).map((c) => [`${c.instanceId}#${c.remoteJid}`, c]),
     );
     const groups = Object.fromEntries(
       groups_solved.filter((g) => g !== null).map((g) => [`${g.instanceId}#${g.id}`, g]),
@@ -327,6 +327,7 @@ export class KwikController {
         tinfo = contacts[`${message.instanceId}#${message.remotejid}`];
         type = 'CONTACT';
       }
+
       data.push({
         message: message,
 
