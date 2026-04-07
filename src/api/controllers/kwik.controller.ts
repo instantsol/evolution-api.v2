@@ -396,26 +396,49 @@ export class KwikController {
 
   public async flagRestrictedWords({ instanceName }: InstanceDto, message_id: string, word: string, group: string) {
     const instance = await this.prismaRepository.instance.findFirst({ where: { name: instanceName } });
-    const message = await this.prismaRepository.message.findFirst({
-      where: { instanceId: instance.id, id: message_id },
+
+    if (!instance) {
+      return { status: 'error', message: `instance not found: ${instanceName}` };
+    }
+
+    let message: any = null;
+
+    const viewMessage = await this.prismaRepository.messageWithRemoteJid.findFirst({
+      where: { instanceId: instance.id, messageid: message_id },
+      select: { id: true, messageid: true, remotejid: true },
     });
 
-    if (message) {
-      const updated = await this.prismaRepository.message.update({
+    if (viewMessage) {
+      message = { id: viewMessage.id };
+    } else {
+      message = await this.prismaRepository.message.findFirst({
         where: {
           instanceId: instance.id,
-          id: message_id,
+          key: {
+            path: ['id'],
+            equals: message_id,
+          },
         },
-        data: {
-          restricted: true,
-          restricted_word: word,
-          restricted_group: group,
-        },
+        select: { id: true },
       });
-      return { status: 'ok', updated: updated };
-    } else {
+    }
+
+    if (!message) {
       return { status: 'error', message: 'message not found' };
     }
+
+    const updated = await this.prismaRepository.message.update({
+      where: {
+        id: message.id,
+      },
+      data: {
+        restricted: true,
+        restricted_word: word,
+        restricted_group: group,
+      },
+    });
+
+    return { status: 'ok', updated: updated };
   }
 
   public async updateTranscription(
@@ -482,7 +505,24 @@ export class KwikController {
       },
     };
 
-    const data = await this.prismaRepository.messageWithRemoteJid.findMany({ ...payload });
+    const data = await this.prismaRepository.messageWithRemoteJid.findMany({
+      ...payload,
+      select: {
+        id: true,
+        key: true,
+        pushName: true,
+        participant: true,
+        messageType: true,
+        message: true,
+        contextInfo: true,
+        messageTimestamp: true,
+        restricted: true,
+        remotejid: true,
+        instanceId: true,
+        text: true,
+        messageid: true,
+      },
+    });
 
     return data;
   }

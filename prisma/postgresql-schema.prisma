@@ -799,7 +799,8 @@ view MessageWithRemoteJid {
   messageType                  String          
   message                      Json            
   contextInfo                  Json?     
-  messageTimestamp             Int?
+  messageTimestamp             Int?      
+  restricted                   Boolean?             
   remotejid                    String
   instanceId                   String?
   text                         String?
