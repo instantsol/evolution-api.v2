@@ -158,6 +158,33 @@ export class ChannelStartupService {
     this.localSettings.initialConnection = data?.initialConnection;
   }
 
+  public isAllowedMediaType(mediaType: string): boolean {
+    if (!mediaType) {
+      return false;
+    }
+
+    const type = String(mediaType).toLowerCase();
+    const normalizedType = type.endsWith('message')
+      ? type.replace(/message$/, '') === 'ptv'
+        ? 'video'
+        : type.replace(/message$/, '')
+      : type;
+
+    const allowedTypes = Array.isArray(this.localSettings.mediaTypes)
+      ? this.localSettings.mediaTypes.map((item) => String(item).toLowerCase()).filter(Boolean)
+      : null;
+
+    if (!allowedTypes) {
+      return true;
+    }
+
+    if (allowedTypes.length === 0) {
+      return false;
+    }
+
+    return allowedTypes.includes('all') || allowedTypes.includes(type) || allowedTypes.includes(normalizedType);
+  }
+
   public async setSettings(data: SettingsDto) {
     await this.prismaRepository.setting.upsert({
       where: {
