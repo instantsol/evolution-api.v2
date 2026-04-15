@@ -493,30 +493,38 @@ export class BusinessStartupService extends ChannelStartupService {
 
                 const size = result.headers['content-length'] || buffer.data.byteLength;
 
-                const fullName = join(`${this.instance.id}`, key.remoteJid, mediaType, fileName);
-
-                await s3Service.uploadFile(fullName, buffer.data, size, {
-                  'Content-Type': mimetype,
-                });
-
                 const createdMessage = await this.prismaRepository.message.create({
                   data: messageRaw,
                 });
 
-                await this.prismaRepository.media.create({
-                  data: {
-                    messageId: createdMessage.id,
-                    instanceId: this.instanceId,
-                    type: mediaType,
-                    fileName: fullName,
-                    mimetype,
-                  },
-                });
+                if (!this.isAllowedMediaType(mediaType)) {
+                  this.logger.log(
+                    `Skipping media persistence for type ${mediaType} because instance mediaTypes is restricted: ${JSON.stringify(
+                      this.localSettings.mediaTypes,
+                    )}`,
+                  );
+                } else {
+                  const fullName = join(`${this.instance.id}`, key.remoteJid, mediaType, fileName);
 
-                const mediaUrl = await s3Service.getObjectUrl(fullName);
+                  await s3Service.uploadFile(fullName, buffer.data, size, {
+                    'Content-Type': mimetype,
+                  });
 
-                messageRaw.message.mediaUrl = mediaUrl;
-                messageRaw.message.base64 = buffer.data.toString('base64');
+                  await this.prismaRepository.media.create({
+                    data: {
+                      messageId: createdMessage.id,
+                      instanceId: this.instanceId,
+                      type: mediaType,
+                      fileName: fullName,
+                      mimetype,
+                    },
+                  });
+
+                  const mediaUrl = await s3Service.getObjectUrl(fullName);
+
+                  messageRaw.message.mediaUrl = mediaUrl;
+                  messageRaw.message.base64 = buffer.data.toString('base64');
+                }
 
                 // Processar OpenAI speech-to-text para áudio após o mediaUrl estar disponível
                 if (this.configService.get<Openai>('OPENAI').ENABLED && mediaType === 'audio') {
