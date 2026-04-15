@@ -705,10 +705,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
-      await this.loadChatwoot();
+      this.loadChatwoot();
       await this.loadSettings();
-      await this.loadWebhook();
-      await this.loadProxy();
+      this.loadWebhook();
+      this.loadProxy();
 
       return await this.createClient(number);
     } catch (error) {
