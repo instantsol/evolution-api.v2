@@ -1,4 +1,5 @@
 import { InstanceDto } from '@api/dto/instance.dto';
+import { BUCKET, deleteFile } from '@api/integrations/storage/s3/libs/minio.server';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { SettingsService } from '@api/services/settings.service';
@@ -66,6 +67,70 @@ export class KwikController {
 
   private firstMultipleBefore(X, Y) {
     return Math.floor(Y / X) * X;
+  }
+
+  private extractFileNameFromMediaUrl(mediaUrl?: string | null) {
+    if (!mediaUrl) {
+      return null;
+    }
+
+    try {
+      let normalizedPath = decodeURIComponent(new URL(mediaUrl).pathname || '').replace(/^\/+/, '');
+      const bucketName = BUCKET?.BUCKET_NAME;
+
+      if (bucketName && normalizedPath.startsWith(`${bucketName}/`)) {
+        normalizedPath = normalizedPath.substring(bucketName.length + 1);
+      }
+
+      if (normalizedPath.startsWith('evolution-api/')) {
+        normalizedPath = normalizedPath.substring('evolution-api/'.length);
+      }
+
+      return normalizedPath || null;
+    } catch {
+      logger.warn(`Failed to parse mediaUrl for cleanup: ${mediaUrl}`);
+      return null;
+    }
+  }
+
+  private async deleteStoredMediaFiles(fileNames: string[]) {
+    const uniqueFileNames = Array.from(new Set((fileNames || []).filter(Boolean)));
+    const deletedFileNames: string[] = [];
+    const failedFileNames: string[] = [];
+
+    if (!BUCKET?.ENABLE || uniqueFileNames.length === 0) {
+      return {
+        attemptedCount: uniqueFileNames.length,
+        deletedCount: 0,
+        failedCount: 0,
+        deletedFileNames,
+        failedFileNames,
+      };
+    }
+
+    for (const fileName of uniqueFileNames) {
+      try {
+        const result = await deleteFile('evolution-api', fileName);
+        const failed = result instanceof Error || (result && typeof (result as any).message === 'string');
+
+        if (failed) {
+          failedFileNames.push(fileName);
+        } else {
+          deletedFileNames.push(fileName);
+        }
+      } catch (error) {
+        logger.error(['Error deleting media file from bucket', fileName, error?.message, error?.stack]);
+        failedFileNames.push(fileName);
+      }
+    }
+
+    return {
+      attemptedCount: uniqueFileNames.length,
+      deletedCount: deletedFileNames.length,
+      failedCount: failedFileNames.length,
+      deletedFileNames,
+      failedFileNames,
+    };
   }
 
   public async messageOffset(
@@ -265,6 +330,206 @@ export class KwikController {
     }
 
     return { status: 'ok' };
+  }
+
+  public async listMessagesBefore({ instanceName }: InstanceDto, beforeTimestamp: number, limit = 100, offset = 0) {
+    const instance = await this.prismaRepository.instance.findFirst({ where: { name: instanceName } });
+
+    if (!instance) {
+      return { status: 'error', message: `instance not found: ${instanceName}` };
+    }
+
+    const normalizedBeforeTimestamp = Math.floor(Number(beforeTimestamp));
+    const normalizedLimit = Math.min(Math.max(Math.floor(Number(limit || 100)), 1), 500);
+    const normalizedOffset = Math.max(Math.floor(Number(offset || 0)), 0);
+
+    const where = {
+      instanceId: instance.id,
+      messageTimestamp: {
+        lt: normalizedBeforeTimestamp,
+      },
+    };
+
+    const [candidateCount, messages] = await Promise.all([
+      this.prismaRepository.message.count({ where }),
+      this.prismaRepository.messageWithRemoteJid.findMany({
+        where,
+        orderBy: { messageTimestamp: 'asc' },
+        take: normalizedLimit,
+        skip: normalizedOffset,
+        select: {
+          id: true,
+          key: true,
+          pushName: true,
+          messageType: true,
+          messageTimestamp: true,
+          remotejid: true,
+          text: true,
+          messageid: true,
+          message: true,
+        },
+      }),
+    ]);
+
+    const messageIds = messages.map((message) => message.id);
+    const medias = messageIds.length
+      ? await this.prismaRepository.media.findMany({
+          where: {
+            instanceId: instance.id,
+            messageId: { in: messageIds },
+          },
+          select: {
+            id: true,
+            messageId: true,
+            fileName: true,
+            type: true,
+            mimetype: true,
+          },
+        })
+      : [];
+
+    const mediaByMessageId = medias.reduce(
+      (accumulator, media) => {
+        if (!accumulator[media.messageId]) {
+          accumulator[media.messageId] = [];
+        }
+        accumulator[media.messageId].push(media);
+        return accumulator;
+      },
+      {} as Record<string, Array<{ id: string; messageId: string; fileName: string; type: string; mimetype: string }>>,
+    );
+
+    return {
+      status: 'ok',
+      beforeTimestamp: normalizedBeforeTimestamp,
+      candidateCount,
+      returnedCount: messages.length,
+      offset: normalizedOffset,
+      hasMore: candidateCount > normalizedOffset + messages.length,
+      messages: messages.map((message) => {
+        const linkedMedia = mediaByMessageId[message.id] || [];
+        const fallbackMediaFile = this.extractFileNameFromMediaUrl((message.message as any)?.mediaUrl);
+        const mediaFiles = linkedMedia.map((media) => media.fileName);
+
+        if (fallbackMediaFile && !mediaFiles.includes(fallbackMediaFile)) {
+          mediaFiles.push(fallbackMediaFile);
+        }
+
+        return {
+          id: message.id,
+          messageId: message.messageid,
+          remoteJid: message.remotejid,
+          pushName: message.pushName,
+          messageType: message.messageType,
+          messageTimestamp: message.messageTimestamp,
+          fromMe: (message.key as any)?.fromMe ?? null,
+          text: message.text,
+          mediaCount: mediaFiles.length,
+          mediaFiles,
+          mediaTypes: linkedMedia.map((media) => media.type),
+        };
+      }),
+    };
+  }
+
+  public async deleteMessagesBefore({ instanceName }: InstanceDto, beforeTimestamp: number) {
+    const instance = await this.prismaRepository.instance.findFirst({ where: { name: instanceName } });
+
+    if (!instance) {
+      return { status: 'error', message: `instance not found: ${instanceName}` };
+    }
+
+    const normalizedBeforeTimestamp = Math.floor(Number(beforeTimestamp));
+    const batchSize = 500;
+    let deletedCount = 0;
+    let deletedMediaCount = 0;
+    let deletedMediaFileCount = 0;
+    let failedMediaFileCount = 0;
+    const failedMediaFiles = new Set<string>();
+
+    let hasMoreMessages = true;
+
+    while (hasMoreMessages) {
+      const messages = await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: instance.id,
+          messageTimestamp: {
+            lt: normalizedBeforeTimestamp,
+          },
+        },
+        orderBy: { messageTimestamp: 'asc' },
+        take: batchSize,
+        select: {
+          id: true,
+          message: true,
+        },
+      });
+
+      if (!messages.length) {
+        hasMoreMessages = false;
+        continue;
+      }
+
+      const messageIds = messages.map((message) => message.id);
+      const medias = await this.prismaRepository.media.findMany({
+        where: {
+          instanceId: instance.id,
+          messageId: { in: messageIds },
+        },
+        select: {
+          id: true,
+          messageId: true,
+          fileName: true,
+        },
+      });
+
+      const mediaFileNames = new Set<string>();
+
+      for (const media of medias) {
+        if (media.fileName) {
+          mediaFileNames.add(media.fileName);
+        }
+      }
+
+      for (const message of messages) {
+        const fallbackMediaFile = this.extractFileNameFromMediaUrl((message.message as any)?.mediaUrl);
+        if (fallbackMediaFile) {
+          mediaFileNames.add(fallbackMediaFile);
+        }
+      }
+
+      const mediaDeletionResult = await this.deleteStoredMediaFiles(Array.from(mediaFileNames));
+      deletedMediaFileCount += mediaDeletionResult.deletedCount;
+      failedMediaFileCount += mediaDeletionResult.failedCount;
+      mediaDeletionResult.failedFileNames.forEach((fileName) => failedMediaFiles.add(fileName));
+
+      if (medias.length) {
+        const deletedMedia = await this.prismaRepository.media.deleteMany({
+          where: {
+            id: { in: medias.map((media) => media.id) },
+          },
+        });
+        deletedMediaCount += deletedMedia.count;
+      }
+
+      const deletedMessages = await this.prismaRepository.message.deleteMany({
+        where: {
+          id: { in: messageIds },
+        },
+      });
+      deletedCount += deletedMessages.count;
+    }
+
+    return {
+      status: 'ok',
+      beforeTimestamp: normalizedBeforeTimestamp,
+      deletedCount,
+      deletedMediaCount,
+      deletedMediaFileCount,
+      failedMediaFileCount,
+      failedMediaFiles: Array.from(failedMediaFiles).slice(0, 50),
+      storageEnabled: BUCKET?.ENABLE === true,
+    };
   }
 
   public async textSearch({ instanceName }: InstanceDto, query: SearchObject) {
