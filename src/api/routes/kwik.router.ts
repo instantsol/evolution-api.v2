@@ -75,6 +75,50 @@ export class KwikRouter extends RouterBroker {
       return res.status(HttpStatus.OK).json(response);
     });
 
+    this.router.post(this.routerPath('deleteMessagesBefore'), ...guards, async (req, res) => {
+      const beforeTimestamp = Number(req.body?.beforeTimestamp);
+
+      if (!Number.isFinite(beforeTimestamp)) {
+        return res.status(HttpStatus.BAD_REQUEST).json({ message: 'beforeTimestamp is required' });
+      }
+
+      const response = await this.dataValidate<InstanceDto>({
+        request: req,
+        schema: null,
+        ClassRef: InstanceDto,
+        execute: (instance) => kwikController.deleteMessagesBefore(instance, beforeTimestamp),
+      });
+
+      if (response?.status === 'error') {
+        return res.status(HttpStatus.NOT_FOUND).json(response);
+      }
+
+      return res.status(HttpStatus.OK).json(response);
+    });
+
+    this.router.post(this.routerPath('listMessagesBefore'), ...guards, async (req, res) => {
+      const beforeTimestamp = Number(req.body?.beforeTimestamp);
+      const limit = Number(req.body?.limit ?? 100);
+      const offset = Number(req.body?.offset ?? 0);
+
+      if (!Number.isFinite(beforeTimestamp)) {
+        return res.status(HttpStatus.BAD_REQUEST).json({ message: 'beforeTimestamp is required' });
+      }
+
+      const response = await this.dataValidate<InstanceDto>({
+        request: req,
+        schema: null,
+        ClassRef: InstanceDto,
+        execute: (instance) => kwikController.listMessagesBefore(instance, beforeTimestamp, limit, offset),
+      });
+
+      if (response?.status === 'error') {
+        return res.status(HttpStatus.NOT_FOUND).json(response);
+      }
+
+      return res.status(HttpStatus.OK).json(response);
+    });
+
     this.router.post(this.routerPath('textSearch'), ...guards, async (req, res) => {
       logger.verbose('request received in textSearch');
       logger.verbose('request body: ');
