@@ -3764,7 +3764,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      if ('messageContextInfo' in msg.message && Object.keys(msg.message).length === 1) {
+      const messageOwnKeys = Object.keys(msg.message);
+      if (messageOwnKeys.length === 1 && messageOwnKeys[0] === 'messageContextInfo') {
         throw 'The message is messageContextInfo';
       }
 
