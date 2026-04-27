@@ -99,6 +99,7 @@ import makeWASocket, {
   Chat,
   ConnectionState,
   Contact,
+  decryptPollVote,
   delay,
   DisconnectReason,
   downloadContentFromMessage,
@@ -113,6 +114,7 @@ import makeWASocket, {
   isJidGroup,
   isJidNewsletter,
   isPnUser,
+  jidNormalizedUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   MessageUserReceiptUpdate,
@@ -133,6 +135,7 @@ import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
+import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
@@ -247,6 +250,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+  private eventProcessingQueue: Promise<void> = Promise.resolve();
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -265,6 +269,28 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
+
+    const db = this.configService.get<Database>('DATABASE');
+    const cache = this.configService.get<CacheConf>('CACHE');
+    const provider = this.configService.get<ProviderSession>('PROVIDER');
+
+    if (provider?.ENABLED) {
+      const authState = await this.authStateProvider.authStateProvider(this.instance.id);
+
+      await authState.removeCreds();
+    }
+
+    if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
+      const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
+
+    if (db.SAVE_DATA.INSTANCE) {
+      const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
 
     const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
     if (sessionExists) {
@@ -506,7 +532,8 @@ export class BaileysStartupService extends ChannelStartupService {
       if (full) {
         return webMessageInfo[0];
       }
-      if (webMessageInfo[0].message?.pollCreationMessage) {
+
+      if (webMessageInfo[0].message?.pollCreationMessage || webMessageInfo[0].message?.pollCreationMessageV3) {
         const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
 
         if (typeof messageSecretBase64 === 'string') {
@@ -515,6 +542,7 @@ export class BaileysStartupService extends ChannelStartupService {
           const msg = {
             messageContextInfo: { messageSecret },
             pollCreationMessage: webMessageInfo[0].message?.pollCreationMessage,
+            pollCreationMessageV3: webMessageInfo[0].message?.pollCreationMessageV3,
           };
 
           return msg;
@@ -568,15 +596,6 @@ export class BaileysStartupService extends ChannelStartupService {
     const baileysVersion = await fetchLatestWaWebVersion({});
     const version = baileysVersion.version;
     const log = `Baileys version: ${version.join('.')}`;
-
-    // if (session.VERSION) {
-    //   version = session.VERSION.split('.');
-    //   log = `Baileys version env: ${version}`;
-    // } else {
-    //   const baileysVersion = await fetchLatestWaWebVersion({});
-    //   version = baileysVersion.version;
-    //   log = `Baileys version: ${version}`;
-    // }
 
     this.logger.info(log);
 
@@ -710,6 +729,11 @@ export class BaileysStartupService extends ChannelStartupService {
       this.loadWebhook();
       this.loadProxy();
 
+      // Remontar o messageProcessor para garantir que está funcionando após reconexão
+      this.messageProcessor.mount({
+        onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+      });
+
       return await this.createClient(number);
     } catch (error) {
       this.logger.error(error);
@@ -839,10 +863,12 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
           await Promise.all(
             updatedContacts.map(async (contact) => {
-              const update = this.prismaRepository.contact.updateMany({
-                where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
-                data: { profilePicUrl: contact.profilePicUrl },
-              });
+              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+                await this.prismaRepository.contact.updateMany({
+                  where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
+                  data: { profilePicUrl: contact.profilePicUrl },
+                });
+              }
 
               if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
                 const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
@@ -861,8 +887,6 @@ export class BaileysStartupService extends ChannelStartupService {
                   avatar_url: contact.profilePicUrl,
                 });
               }
-
-              return update;
             }),
           );
         }
@@ -893,14 +917,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
 
-      const updateTransactions = contactsRaw.map((contact) =>
-        this.prismaRepository.contact.upsert({
-          where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
-          create: contact,
-          update: contact,
-        }),
-      );
-      await this.prismaRepository.$transaction(updateTransactions);
+      if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+        const updateTransactions = contactsRaw.map((contact) =>
+          this.prismaRepository.contact.upsert({
+            where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
+            create: contact,
+            update: contact,
+          }),
+        );
+        await this.prismaRepository.$transaction(updateTransactions);
+      }
 
       //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
@@ -1033,7 +1059,10 @@ export class BaileysStartupService extends ChannelStartupService {
           messagesRaw.push(this.prepareMessage(m));
         }
 
-        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw]);
+        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
+          isLatest,
+          progress,
+        });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
@@ -1084,6 +1113,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 'Invalid PreKey ID',
                 'No session record',
                 'No session found to decrypt message',
+                'Message absent from node',
               ].some((err) => param?.includes?.(err)),
             )
           ) {
@@ -1125,6 +1155,11 @@ export class BaileysStartupService extends ChannelStartupService {
               );
 
             await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
+
+            if (received.key?.id && editedMessage.key?.id) {
+              await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
+            }
+
             const oldMessage = await this.getMessage(editedMessage.key, true);
             if ((oldMessage as any)?.id) {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
@@ -1170,12 +1205,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
 
-          if (
-            (type !== 'notify' && type !== 'append') ||
-            editedMessage ||
-            received.message?.pollUpdateMessage ||
-            !received?.message
-          ) {
+          if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
             continue;
           }
 
@@ -1214,6 +1244,113 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageRaw = this.prepareMessage(received);
+
+          if (messageRaw.messageType === 'pollUpdateMessage') {
+            const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;
+            const pollMessage = (await this.getMessage(pollCreationKey, true)) as proto.IWebMessageInfo;
+            const pollMessageSecret = (await this.getMessage(pollCreationKey)) as any;
+
+            if (pollMessage) {
+              const pollOptions =
+                (pollMessage.message as any).pollCreationMessage?.options ||
+                (pollMessage.message as any).pollCreationMessageV3?.options ||
+                [];
+              const pollVote = messageRaw.message.pollUpdateMessage.vote;
+
+              const voterJid = received.key.fromMe
+                ? this.instance.wuid
+                : received.key.participant || received.key.remoteJid;
+              const voterName = received.key.fromMe
+                ? this.instance.name
+                : received.pushName || received.key.participant || received.key.remoteJid;
+
+              let pollEncKey = pollMessageSecret?.messageContextInfo?.messageSecret;
+
+              let successfulVoterJid = voterJid;
+              const successfulVoterName = voterName;
+
+              if (typeof pollEncKey === 'string') {
+                pollEncKey = Buffer.from(pollEncKey, 'base64');
+              } else if (pollEncKey?.type === 'Buffer' && Array.isArray(pollEncKey.data)) {
+                pollEncKey = Buffer.from(pollEncKey.data);
+              }
+
+              if (Buffer.isBuffer(pollEncKey) && pollEncKey.length === 44) {
+                pollEncKey = Buffer.from(pollEncKey.toString('utf8'), 'base64');
+              }
+
+              if (pollVote.encPayload && pollEncKey) {
+                const creatorCandidates = [
+                  this.instance.wuid,
+                  this.client.user?.lid,
+                  pollMessage.key.participant,
+                  (pollMessage.key as any).participantAlt,
+                  pollMessage.key.remoteJid,
+                ];
+
+                const key = received.key as any;
+                const voterCandidates = [
+                  this.instance.wuid,
+                  this.client.user?.lid,
+                  key.participant,
+                  key.participantAlt,
+                  key.remoteJidAlt,
+                  key.remoteJid,
+                ];
+
+                const uniqueCreators = [
+                  ...new Set(creatorCandidates.filter(Boolean).map((id) => jidNormalizedUser(id))),
+                ];
+                const uniqueVoters = [...new Set(voterCandidates.filter(Boolean).map((id) => jidNormalizedUser(id)))];
+
+                let decryptedVote;
+
+                for (const creator of uniqueCreators) {
+                  for (const voter of uniqueVoters) {
+                    try {
+                      decryptedVote = decryptPollVote(pollVote, {
+                        pollCreatorJid: creator,
+                        pollMsgId: pollMessage.key.id,
+                        pollEncKey,
+                        voterJid: voter,
+                      } as any);
+                      if (decryptedVote) {
+                        successfulVoterJid = voter;
+                        break;
+                      }
+                    } catch {
+                      // Continue trying
+                    }
+                  }
+                  if (decryptedVote) break;
+                }
+
+                if (decryptedVote) {
+                  Object.assign(pollVote, decryptedVote);
+                }
+              }
+
+              const selectedOptions = pollVote?.selectedOptions || [];
+
+              const selectedOptionNames = pollOptions
+                .filter((option) => {
+                  const hash = createHash('sha256').update(option.optionName).digest();
+                  return selectedOptions.some((selected) => Buffer.compare(selected, hash) === 0);
+                })
+                .map((option) => option.optionName);
+
+              messageRaw.message.pollUpdateMessage.vote.selectedOptions = selectedOptionNames;
+
+              const pollUpdates = pollOptions.map((option) => ({
+                name: option.optionName,
+                voters: selectedOptionNames.includes(option.optionName)
+                  ? [{ id: successfulVoterJid, name: successfulVoterName }]
+                  : [],
+              }));
+
+              messageRaw.pollUpdates = pollUpdates;
+            }
+          }
 
           const isMedia =
             received?.message?.imageMessage ||
@@ -1264,7 +1401,44 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-            const msg = await this.prismaRepository.message.create({ data: messageRaw });
+            const pollUpdatesForMessageUpdate = Array.isArray((messageRaw as any).pollUpdates)
+              ? (messageRaw as any).pollUpdates
+              : undefined;
+            const messageDataForDb: any = { ...messageRaw };
+            let pollCreationDatabaseMessage: any;
+            let pollCreationKeyForUpdate: any;
+
+            if (pollUpdatesForMessageUpdate) {
+              delete messageDataForDb.pollUpdates;
+              pollCreationKeyForUpdate = messageRaw.message?.pollUpdateMessage?.pollCreationMessageKey;
+
+              if (pollCreationKeyForUpdate?.id) {
+                const messages = (await this.prismaRepository.$queryRaw`
+                  SELECT * FROM "Message"
+                  WHERE "instanceId" = ${this.instanceId}
+                  AND "key"->>'id' = ${pollCreationKeyForUpdate.id}
+                  LIMIT 1
+                `) as any[];
+                pollCreationDatabaseMessage = messages[0] || null;
+              }
+            }
+
+            const msg = await this.prismaRepository.message.create({ data: messageDataForDb });
+
+            if (pollUpdatesForMessageUpdate) {
+              await this.prismaRepository.messageUpdate.create({
+                data: {
+                  fromMe: pollCreationKeyForUpdate?.fromMe ?? received.key.fromMe,
+                  keyId: pollCreationKeyForUpdate?.id ?? received.key.id,
+                  remoteJid: pollCreationKeyForUpdate?.remoteJid ?? received.key.remoteJid,
+                  participant: pollCreationKeyForUpdate?.participant ?? received.key.participant,
+                  status: 'POLL_UPDATE',
+                  pollUpdates: pollUpdatesForMessageUpdate,
+                  instanceId: this.instanceId,
+                  messageId: pollCreationDatabaseMessage?.id ?? msg.id,
+                },
+              });
+            }
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
@@ -1311,6 +1485,11 @@ export class BaileysStartupService extends ChannelStartupService {
                     this.logger.warn('Message detected as media but contains no valid media content');
                   } else {
                     const media = await this.getBase64FromMediaMessage({ message }, true);
+
+                    if (!media) {
+                      this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
+                      return;
+                    }
 
                     const { buffer, mediaType, fileName, size } = media;
 
@@ -1388,6 +1567,10 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
+            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+          }
+          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
@@ -1485,18 +1668,26 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
-        if (update.message !== null && update.status === undefined) continue;
-
         const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
 
         const cached = await this.baileysCache.get(updateKey);
 
-        if (cached) {
-          this.logger.info(`Message duplicated ignored [avoid deadlock]: ${updateKey}`);
+        const secondsSinceEpoch = Math.floor(Date.now() / 1000);
+        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
+
+        if (
+          (update.messageTimestamp && update.messageTimestamp === cached) ||
+          (!update.messageTimestamp && secondsSinceEpoch === cached)
+        ) {
+          this.logger.info(`Update Message duplicated ignored [avoid deadlock]: ${updateKey}`);
           continue;
         }
 
-        await this.baileysCache.set(updateKey, true, 30 * 60);
+        if (update.messageTimestamp) {
+          await this.baileysCache.set(updateKey, update.messageTimestamp, 30 * 60);
+        } else {
+          await this.baileysCache.set(updateKey, secondsSinceEpoch, 30 * 60);
+        }
 
         if (status[update.status] === 'READ' && key.fromMe) {
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -1527,19 +1718,32 @@ export class BaileysStartupService extends ChannelStartupService {
             remoteJid: key?.remoteJid,
             fromMe: key.fromMe,
             participant: key?.participant,
-            status: status[update.status] ?? 'DELETED',
+            status: status[update.status] ?? 'SERVER_ACK',
             pollUpdates,
             instanceId: this.instanceId,
           };
+
+          if (update.message) {
+            message.message = update.message;
+          }
 
           let findMessage: any;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
             // Use raw SQL to avoid JSON path issues
+            const protocolMapKey = `protocol_${key.id}`;
+            const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
+
+            if (originalMessageId) {
+              message.keyId = originalMessageId;
+            }
+
+            const searchId = originalMessageId || key.id;
+
             const messages = (await this.prismaRepository.$queryRaw`
               SELECT * FROM "Message"
               WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${key.id}
+              AND "key"->>'id' = ${searchId}
               LIMIT 1
             `) as any[];
             findMessage = messages[0] || null;
@@ -1552,7 +1756,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (update.message === null && update.status === undefined) {
-            this.sendDataWebhook(Events.MESSAGES_DELETE, key);
+            this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
               await this.prismaRepository.messageUpdate.create({ data: message });
@@ -1600,8 +1804,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-            await this.prismaRepository.messageUpdate.create({ data: message });
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { message: _msg, ...messageData } = message;
+            await this.prismaRepository.messageUpdate.create({ data: messageData });
+          }
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
@@ -1660,9 +1867,9 @@ export class BaileysStartupService extends ChannelStartupService {
       // This enables LID to phoneNumber conversion without breaking existing webhook consumers
 
       // Helper to normalize participantId as phone number
-      const normalizePhoneNumber = (id: string): string => {
+      const normalizePhoneNumber = (id: string | null | undefined): string => {
         // Remove @lid, @s.whatsapp.net suffixes and extract just the number part
-        return id.split('@')[0];
+        return String(id || '').split('@')[0];
       };
 
       try {
@@ -1778,135 +1985,141 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private eventHandler() {
     this.client.ev.process(async (events) => {
-      if (!this.endSession) {
-        const database = this.configService.get<Database>('DATABASE');
-        const settings = await this.findSettings();
+      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+        try {
+          if (!this.endSession) {
+            const database = this.configService.get<Database>('DATABASE');
+            const settings = await this.findSettings();
 
-        if (events.call) {
-          const call = events.call[0];
+            if (events.call) {
+              const call = events.call[0];
 
-          if (settings?.rejectCall && call.status == 'offer') {
-            this.client.rejectCall(call.id, call.from);
-          }
+              if (settings?.rejectCall && call.status == 'offer') {
+                this.client.rejectCall(call.id, call.from);
+              }
 
-          if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-            if (call.from.endsWith('@lid')) {
-              call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+                if (call.from.endsWith('@lid')) {
+                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+                }
+                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+              }
+
+              this.sendDataWebhook(Events.CALL, call);
             }
-            const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-            this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-          }
+            if (events['connection.update']) {
+              this.connectionUpdate(events['connection.update']);
+            }
 
-          this.sendDataWebhook(Events.CALL, call);
-        }
+            if (events['creds.update']) {
+              this.instance.authState.saveCreds();
+            }
 
-        if (events['connection.update']) {
-          this.connectionUpdate(events['connection.update']);
-        }
+            if (events['messaging-history.set']) {
+              const payload = events['messaging-history.set'];
+              await this.messageHandle['messaging-history.set'](payload);
+            }
 
-        if (events['creds.update']) {
-          this.instance.authState.saveCreds();
-        }
+            if (events['messages.upsert']) {
+              const payload = events['messages.upsert'];
 
-        if (events['messaging-history.set']) {
-          const payload = events['messaging-history.set'];
-          this.messageHandle['messaging-history.set'](payload);
-        }
+              // this.messageProcessor.processMessage(payload, settings);
+              await this.messageHandle['messages.upsert'](payload, settings);
+            }
 
-        if (events['messages.upsert']) {
-          const payload = events['messages.upsert'];
+            if (events['messages.update']) {
+              const payload = events['messages.update'];
+              await this.messageHandle['messages.update'](payload, settings);
+            }
 
-          this.messageProcessor.processMessage(payload, settings);
-          // this.messageHandle['messages.upsert'](payload, settings);
-        }
+            if (events['message-receipt.update']) {
+              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+              const remotesJidMap: Record<string, number> = {};
 
-        if (events['messages.update']) {
-          const payload = events['messages.update'];
-          this.messageHandle['messages.update'](payload, settings);
-        }
+              for (const event of payload) {
+                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                }
+              }
 
-        if (events['message-receipt.update']) {
-          const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-          const remotesJidMap: Record<string, number> = {};
+              await Promise.all(
+                Object.keys(remotesJidMap).map(async (remoteJid) =>
+                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+                ),
+              );
+            }
 
-          for (const event of payload) {
-            if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-              remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+            if (events['presence.update']) {
+              const payload = events['presence.update'];
+
+              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+                return;
+              }
+
+              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+            }
+
+            if (!settings?.groupsIgnore) {
+              if (events['groups.upsert']) {
+                const payload = events['groups.upsert'];
+                this.groupHandler['groups.upsert'](payload);
+              }
+
+              if (events['groups.update']) {
+                const payload = events['groups.update'];
+                this.groupHandler['groups.update'](payload);
+              }
+
+              if (events['group-participants.update']) {
+                const payload = events['group-participants.update'] as any;
+                this.groupHandler['group-participants.update'](payload);
+              }
+            }
+
+            if (events['chats.upsert']) {
+              const payload = events['chats.upsert'];
+              this.chatHandle['chats.upsert'](payload);
+            }
+
+            if (events['chats.update']) {
+              const payload = events['chats.update'];
+              this.chatHandle['chats.update'](payload);
+            }
+
+            if (events['chats.delete']) {
+              const payload = events['chats.delete'];
+              this.chatHandle['chats.delete'](payload);
+            }
+
+            if (events['contacts.upsert']) {
+              const payload = events['contacts.upsert'];
+              this.contactHandle['contacts.upsert'](payload);
+            }
+
+            if (events['contacts.update']) {
+              const payload = events['contacts.update'];
+              this.contactHandle['contacts.update'](payload);
+            }
+
+            if (events[Events.LABELS_ASSOCIATION]) {
+              const payload = events[Events.LABELS_ASSOCIATION];
+              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
+              return;
+            }
+
+            if (events[Events.LABELS_EDIT]) {
+              const payload = events[Events.LABELS_EDIT];
+              this.labelHandle[Events.LABELS_EDIT](payload);
+              return;
             }
           }
-
-          await Promise.all(
-            Object.keys(remotesJidMap).map(async (remoteJid) =>
-              this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-            ),
-          );
+        } catch (error) {
+          this.logger.error(error);
         }
-
-        if (events['presence.update']) {
-          const payload = events['presence.update'];
-
-          if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-            return;
-          }
-
-          this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-        }
-
-        if (!settings?.groupsIgnore) {
-          if (events['groups.upsert']) {
-            const payload = events['groups.upsert'];
-            this.groupHandler['groups.upsert'](payload);
-          }
-
-          if (events['groups.update']) {
-            const payload = events['groups.update'];
-            this.groupHandler['groups.update'](payload);
-          }
-
-          if (events['group-participants.update']) {
-            const payload = events['group-participants.update'] as any;
-            this.groupHandler['group-participants.update'](payload);
-          }
-        }
-
-        if (events['chats.upsert']) {
-          const payload = events['chats.upsert'];
-          this.chatHandle['chats.upsert'](payload);
-        }
-
-        if (events['chats.update']) {
-          const payload = events['chats.update'];
-          this.chatHandle['chats.update'](payload);
-        }
-
-        if (events['chats.delete']) {
-          const payload = events['chats.delete'];
-          this.chatHandle['chats.delete'](payload);
-        }
-
-        if (events['contacts.upsert']) {
-          const payload = events['contacts.upsert'];
-          this.contactHandle['contacts.upsert'](payload);
-        }
-
-        if (events['contacts.update']) {
-          const payload = events['contacts.update'];
-          this.contactHandle['contacts.update'](payload);
-        }
-
-        if (events[Events.LABELS_ASSOCIATION]) {
-          const payload = events[Events.LABELS_ASSOCIATION];
-          this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-          return;
-        }
-
-        if (events[Events.LABELS_EDIT]) {
-          const payload = events[Events.LABELS_EDIT];
-          this.labelHandle[Events.LABELS_EDIT](payload);
-          return;
-        }
-      }
+      });
     });
   }
 
@@ -2371,6 +2584,11 @@ export class BaileysStartupService extends ChannelStartupService {
               this.logger.warn('Message detected as media but contains no valid media content');
             } else {
               const media = await this.getBase64FromMediaMessage({ message }, true);
+
+              if (!media) {
+                this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
+                return;
+              }
 
               const { buffer, mediaType, fileName, size } = media;
 
@@ -3766,7 +3984,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const messageOwnKeys = Object.keys(msg.message);
       if (messageOwnKeys.length === 1 && messageOwnKeys[0] === 'messageContextInfo') {
-        throw 'The message is messageContextInfo';
+        this.logger.verbose('Message contains only messageContextInfo, skipping media processing');
+        return null;
       }
 
       let mediaMessage: any;
@@ -4950,7 +5169,6 @@ export class BaileysStartupService extends ChannelStartupService {
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
           {
             OR: [
@@ -4980,7 +5198,6 @@ export class BaileysStartupService extends ChannelStartupService {
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
           {
             OR: [
