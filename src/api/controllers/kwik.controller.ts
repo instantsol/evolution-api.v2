@@ -518,6 +518,12 @@ export class KwikController {
         },
       });
       deletedCount += deletedMessages.count;
+
+      await this.prismaRepository.messageUpdate.deleteMany({
+        where: {
+          messageId: { in: messageIds },
+        },
+      });
     }
 
     return {
@@ -789,6 +795,50 @@ export class KwikController {
       },
     });
 
-    return data;
+    const pollMessages = data.filter((item: any) => item?.messageType === 'pollCreationMessageV3' && item?.id);
+
+    if (!pollMessages.length) {
+      return data;
+    }
+
+    const pollMessageIds = pollMessages.map((item: any) => item.id);
+    const pollUpdateRows = await this.prismaRepository.messageUpdate.findMany({
+      where: {
+        messageId: {
+          in: pollMessageIds,
+        },
+      },
+      orderBy: {
+        id: 'desc',
+      },
+      select: {
+        messageId: true,
+        pollUpdates: true,
+      },
+    });
+
+    const latestPollUpdates = new Map();
+
+    for (const row of pollUpdateRows as any[]) {
+      if (latestPollUpdates.has(row.messageId)) {
+        continue;
+      }
+
+      if (Array.isArray(row.pollUpdates) && row.pollUpdates.length) {
+        latestPollUpdates.set(row.messageId, row.pollUpdates);
+      }
+    }
+
+    return data.map((item: any) => {
+      if (item?.messageType !== 'pollCreationMessageV3') {
+        return item;
+      }
+
+      const pollUpdates = latestPollUpdates.get(item.id) || [];
+      return {
+        ...item,
+        pollUpdates,
+      };
+    });
   }
 }

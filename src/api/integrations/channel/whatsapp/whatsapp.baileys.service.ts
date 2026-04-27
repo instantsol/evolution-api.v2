@@ -532,7 +532,8 @@ export class BaileysStartupService extends ChannelStartupService {
       if (full) {
         return webMessageInfo[0];
       }
-      if (webMessageInfo[0].message?.pollCreationMessage) {
+
+      if (webMessageInfo[0].message?.pollCreationMessage || webMessageInfo[0].message?.pollCreationMessageV3) {
         const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
 
         if (typeof messageSecretBase64 === 'string') {
@@ -541,6 +542,7 @@ export class BaileysStartupService extends ChannelStartupService {
           const msg = {
             messageContextInfo: { messageSecret },
             pollCreationMessage: webMessageInfo[0].message?.pollCreationMessage,
+            pollCreationMessageV3: webMessageInfo[0].message?.pollCreationMessageV3,
           };
 
           return msg;
@@ -1193,6 +1195,16 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          const messageKey = `${this.instance.id}_${received.key.id}`;
+          const cached = await this.baileysCache.get(messageKey);
+
+          if (cached && !editedMessage && !requestId) {
+            this.logger.info(`Message duplicated ignored: ${received.key.id}`);
+            continue;
+          }
+
+          await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+
           if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
             continue;
           }
@@ -1248,10 +1260,14 @@ export class BaileysStartupService extends ChannelStartupService {
               const voterJid = received.key.fromMe
                 ? this.instance.wuid
                 : received.key.participant || received.key.remoteJid;
+              const voterName = received.key.fromMe
+                ? this.instance.name
+                : received.pushName || received.key.participant || received.key.remoteJid;
 
               let pollEncKey = pollMessageSecret?.messageContextInfo?.messageSecret;
 
               let successfulVoterJid = voterJid;
+              const successfulVoterName = voterName;
 
               if (typeof pollEncKey === 'string') {
                 pollEncKey = Buffer.from(pollEncKey, 'base64');
@@ -1327,7 +1343,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
               const pollUpdates = pollOptions.map((option) => ({
                 name: option.optionName,
-                voters: selectedOptionNames.includes(option.optionName) ? [successfulVoterJid] : [],
+                voters: selectedOptionNames.includes(option.optionName)
+                  ? [{ id: successfulVoterJid, name: successfulVoterName }]
+                  : [],
               }));
 
               messageRaw.pollUpdates = pollUpdates;
@@ -1383,9 +1401,44 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { pollUpdates, ...messageData } = messageRaw;
-            const msg = await this.prismaRepository.message.create({ data: messageData });
+            const pollUpdatesForMessageUpdate = Array.isArray((messageRaw as any).pollUpdates)
+              ? (messageRaw as any).pollUpdates
+              : undefined;
+            const messageDataForDb: any = { ...messageRaw };
+            let pollCreationDatabaseMessage: any;
+            let pollCreationKeyForUpdate: any;
+
+            if (pollUpdatesForMessageUpdate) {
+              delete messageDataForDb.pollUpdates;
+              pollCreationKeyForUpdate = messageRaw.message?.pollUpdateMessage?.pollCreationMessageKey;
+
+              if (pollCreationKeyForUpdate?.id) {
+                const messages = (await this.prismaRepository.$queryRaw`
+                  SELECT * FROM "Message"
+                  WHERE "instanceId" = ${this.instanceId}
+                  AND "key"->>'id' = ${pollCreationKeyForUpdate.id}
+                  LIMIT 1
+                `) as any[];
+                pollCreationDatabaseMessage = messages[0] || null;
+              }
+            }
+
+            const msg = await this.prismaRepository.message.create({ data: messageDataForDb });
+
+            if (pollUpdatesForMessageUpdate) {
+              await this.prismaRepository.messageUpdate.create({
+                data: {
+                  fromMe: pollCreationKeyForUpdate?.fromMe ?? received.key.fromMe,
+                  keyId: pollCreationKeyForUpdate?.id ?? received.key.id,
+                  remoteJid: pollCreationKeyForUpdate?.remoteJid ?? received.key.remoteJid,
+                  participant: pollCreationKeyForUpdate?.participant ?? received.key.participant,
+                  status: 'POLL_UPDATE',
+                  pollUpdates: pollUpdatesForMessageUpdate,
+                  instanceId: this.instanceId,
+                  messageId: pollCreationDatabaseMessage?.id ?? msg.id,
+                },
+              });
+            }
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
