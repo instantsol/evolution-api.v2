@@ -548,7 +548,7 @@ export class KwikController {
     const messages = await this.prismaRepository.messageWithRemoteJid.findMany({
       where: {
         instanceId: { in: Object.keys(InstancesObject) },
-        text: { contains: query.text_search },
+        text: { contains: query.text_search, mode: 'insensitive' },
       },
       orderBy: { messageTimestamp: 'desc' },
       take: 100,
