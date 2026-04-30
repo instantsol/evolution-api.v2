@@ -1099,6 +1099,8 @@ export class BaileysStartupService extends ChannelStartupService {
       try {
         const ignoreList = new Set(settings.ignoreList);
         for (const received of messages) {
+          const originalMessageKey = { ...(received.key as any) };
+
           received.key.remoteJid =
             received.key.remoteJidAlt && !received.key.remoteJidAlt.includes('@lid')
               ? received.key.remoteJidAlt
@@ -1264,38 +1266,69 @@ export class BaileysStartupService extends ChannelStartupService {
                 ? this.instance.name
                 : received.pushName || received.key.participant || received.key.remoteJid;
 
-              let pollEncKey = pollMessageSecret?.messageContextInfo?.messageSecret;
+              const normalizePollBytes = (value: any): Buffer | undefined => {
+                if (!value) return undefined;
+                if (Buffer.isBuffer(value)) return value;
+                if (value instanceof Uint8Array) return Buffer.from(value);
+                if (typeof value === 'string') return Buffer.from(value, 'base64');
+                if (value?.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+                if (Array.isArray(value)) return Buffer.from(value);
+
+                if (typeof value === 'object') {
+                  const numericKeys = Object.keys(value).filter((key) => /^\d+$/.test(key));
+                  if (numericKeys.length) {
+                    return Buffer.from(numericKeys.sort((a, b) => Number(a) - Number(b)).map((key) => value[key]));
+                  }
+                }
+
+                return undefined;
+              };
+
+              let pollEncKey = normalizePollBytes(pollMessageSecret?.messageContextInfo?.messageSecret);
 
               let successfulVoterJid = voterJid;
               const successfulVoterName = voterName;
-
-              if (typeof pollEncKey === 'string') {
-                pollEncKey = Buffer.from(pollEncKey, 'base64');
-              } else if (pollEncKey?.type === 'Buffer' && Array.isArray(pollEncKey.data)) {
-                pollEncKey = Buffer.from(pollEncKey.data);
-              }
 
               if (Buffer.isBuffer(pollEncKey) && pollEncKey.length === 44) {
                 pollEncKey = Buffer.from(pollEncKey.toString('utf8'), 'base64');
               }
 
-              if (pollVote.encPayload && pollEncKey) {
+              const normalizedPollVote = {
+                ...pollVote,
+                encPayload: normalizePollBytes(pollVote?.encPayload),
+                encIv: normalizePollBytes(pollVote?.encIv),
+              };
+
+              if (normalizedPollVote.encPayload && normalizedPollVote.encIv && pollEncKey) {
+                const pollCreationKeyAny = pollCreationKey as any;
+                const pollMessageKeyAny = pollMessage.key as any;
+                const originalKeyAny = originalMessageKey as any;
+                const key = received.key as any;
+
                 const creatorCandidates = [
+                  pollCreationKeyAny.remoteJid,
+                  pollCreationKeyAny.remoteJidAlt,
+                  pollCreationKeyAny.participant,
+                  pollCreationKeyAny.participantAlt,
+                  pollMessageKeyAny.remoteJid,
+                  pollMessageKeyAny.remoteJidAlt,
+                  pollMessageKeyAny.participant,
+                  pollMessageKeyAny.participantAlt,
                   this.instance.wuid,
                   this.client.user?.lid,
-                  pollMessage.key.participant,
-                  (pollMessage.key as any).participantAlt,
-                  pollMessage.key.remoteJid,
                 ];
 
-                const key = received.key as any;
                 const voterCandidates = [
-                  this.instance.wuid,
-                  this.client.user?.lid,
                   key.participant,
                   key.participantAlt,
-                  key.remoteJidAlt,
                   key.remoteJid,
+                  key.remoteJidAlt,
+                  originalKeyAny.participant,
+                  originalKeyAny.participantAlt,
+                  originalKeyAny.remoteJid,
+                  originalKeyAny.remoteJidAlt,
+                  this.instance.wuid,
+                  this.client.user?.lid,
                 ];
 
                 const uniqueCreators = [
@@ -1308,18 +1341,23 @@ export class BaileysStartupService extends ChannelStartupService {
                 for (const creator of uniqueCreators) {
                   for (const voter of uniqueVoters) {
                     try {
-                      decryptedVote = decryptPollVote(pollVote, {
+                      decryptedVote = decryptPollVote(normalizedPollVote, {
                         pollCreatorJid: creator,
-                        pollMsgId: pollMessage.key.id,
+                        pollMsgId: pollCreationKey.id || pollMessage.key.id,
                         pollEncKey,
                         voterJid: voter,
                       } as any);
                       if (decryptedVote) {
                         successfulVoterJid = voter;
+                        this.logger.verbose(
+                          `DELETEME Poll vote decrypted using creator ${creator} and voter ${voter} for poll ${
+                            pollCreationKey.id || pollMessage.key.id
+                          }`,
+                        );
                         break;
                       }
                     } catch {
-                      // Continue trying
+                      // Continue trying another creator/voter combination
                     }
                   }
                   if (decryptedVote) break;
@@ -1327,28 +1365,235 @@ export class BaileysStartupService extends ChannelStartupService {
 
                 if (decryptedVote) {
                   Object.assign(pollVote, decryptedVote);
+                } else {
+                  this.logger.warn(
+                    `DELETEME Unable to decrypt poll vote for poll ${
+                      pollCreationKey.id || pollMessage.key.id
+                    }. Creation key: ${JSON.stringify(pollCreationKey)}. Vote key: ${JSON.stringify(
+                      received.key,
+                    )}. Original vote key: ${JSON.stringify(originalMessageKey)}. Creator candidates: ${JSON.stringify(
+                      uniqueCreators,
+                    )}. Voter candidates: ${JSON.stringify(uniqueVoters)}`,
+                  );
                 }
               }
 
               const selectedOptions = pollVote?.selectedOptions || [];
 
+              const normalizeSelectedPollOption = (value: any): Buffer | null => {
+                if (!value) return null;
+                if (Buffer.isBuffer(value)) return value;
+                if (value instanceof Uint8Array) return Buffer.from(value);
+                if (Array.isArray(value)) return Buffer.from(value);
+                if (value?.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+
+                if (typeof value === 'object') {
+                  const numericKeys = Object.keys(value).filter((key) => /^\d+$/.test(key));
+                  if (numericKeys.length) {
+                    return Buffer.from(numericKeys.sort((a, b) => Number(a) - Number(b)).map((key) => value[key]));
+                  }
+                }
+
+                return null;
+              };
+
+              const isSelectedPollOption = (optionName: string) => {
+                const optionHash = createHash('sha256').update(optionName).digest();
+
+                return selectedOptions.some((selected) => {
+                  if (typeof selected === 'string') {
+                    if (selected === optionName) {
+                      return true;
+                    }
+
+                    try {
+                      return Buffer.compare(Buffer.from(selected, 'base64'), optionHash) === 0;
+                    } catch {
+                      return false;
+                    }
+                  }
+
+                  const selectedBytes = normalizeSelectedPollOption(selected);
+
+                  return selectedBytes ? Buffer.compare(selectedBytes, optionHash) === 0 : false;
+                });
+              };
+
               const selectedOptionNames = pollOptions
-                .filter((option) => {
-                  const hash = createHash('sha256').update(option.optionName).digest();
-                  return selectedOptions.some((selected) => Buffer.compare(selected, hash) === 0);
-                })
+                .filter((option) => isSelectedPollOption(option.optionName))
                 .map((option) => option.optionName);
 
               messageRaw.message.pollUpdateMessage.vote.selectedOptions = selectedOptionNames;
 
-              const pollUpdates = pollOptions.map((option) => ({
+              const buildEmptyPollUpdates = () =>
+                pollOptions.map((option) => ({
+                  name: option.optionName,
+                  voters: [] as Array<{ id: string; name?: string }>,
+                }));
+
+              type PollVoter = { id: string; name?: string };
+              type PollUpdate = { name: string; voters: PollVoter[] };
+              const parsePollUpdates = (value: any): PollUpdate[] => {
+                let parsedValue = value;
+
+                if (typeof parsedValue === 'string') {
+                  try {
+                    parsedValue = JSON.parse(parsedValue);
+                  } catch {
+                    return [];
+                  }
+                }
+
+                if (!Array.isArray(parsedValue)) {
+                  return [];
+                }
+
+                return parsedValue
+                  .filter((option) => option?.name)
+                  .map((option) => ({
+                    name: String(option.name),
+                    voters: Array.isArray(option.voters)
+                      ? option.voters
+                          .map((voter) => normalizePollVoter(voter))
+                          .filter((voter): voter is PollVoter => Boolean(voter))
+                      : [],
+                  }));
+              };
+
+              const getPollVoterId = (voter: any): string => {
+                if (typeof voter === 'string') {
+                  return voter.trim();
+                }
+
+                if (voter && typeof voter === 'object') {
+                  return String(voter.id || voter.jid || voter.voter || voter.remoteJid || '').trim();
+                }
+
+                return '';
+              };
+
+              const getPollVoterName = (voter: any): string => {
+                if (voter && typeof voter === 'object') {
+                  return String(voter.name || voter.pushName || voter.displayName || '').trim();
+                }
+
+                return '';
+              };
+
+              const normalizePollVoter = (voter: any): PollVoter | null => {
+                const id = getPollVoterId(voter);
+                if (!id) {
+                  return null;
+                }
+
+                const name = getPollVoterName(voter);
+
+                return name ? { id, name } : { id };
+              };
+
+              const addVoterToOption = (option: PollUpdate, voter: PollVoter) => {
+                const existingIndex = option.voters.findIndex((entry) => entry.id === voter.id);
+                if (existingIndex >= 0) {
+                  option.voters[existingIndex] = {
+                    ...option.voters[existingIndex],
+                    ...voter,
+                  };
+                  return;
+                }
+
+                option.voters.push(voter);
+              };
+              const removeVoterFromAllOptions = (optionMap: Map<string, PollUpdate>, voterId: string) => {
+                optionMap.forEach((option) => {
+                  option.voters = option.voters.filter((voter) => voter.id !== voterId);
+                });
+              };
+
+              const mergePollUpdates = (baseUpdates: any, incomingUpdates: any, forcedVoter?: any): PollUpdate[] => {
+                const optionMap = new Map<string, PollUpdate>(
+                  buildEmptyPollUpdates().map((option) => [option.name, { ...option, voters: [...option.voters] }]),
+                );
+
+                parsePollUpdates(baseUpdates).forEach((option) => {
+                  const targetOption = optionMap.get(option.name);
+                  if (!targetOption) {
+                    optionMap.set(option.name, {
+                      name: option.name,
+                      voters: [...option.voters],
+                    });
+                    return;
+                  }
+
+                  option.voters.forEach((voter) => addVoterToOption(targetOption, voter));
+                });
+
+                const affectedVoters = new Map<string, PollVoter>();
+                const normalizedForcedVoter = normalizePollVoter(forcedVoter);
+                if (normalizedForcedVoter) {
+                  affectedVoters.set(normalizedForcedVoter.id, normalizedForcedVoter);
+                }
+
+                parsePollUpdates(incomingUpdates).forEach((option) => {
+                  option.voters.forEach((voter) => affectedVoters.set(voter.id, voter));
+                });
+
+                affectedVoters.forEach((voter) => removeVoterFromAllOptions(optionMap, voter.id));
+
+                parsePollUpdates(incomingUpdates).forEach((option) => {
+                  const targetOption = optionMap.get(option.name);
+                  if (!targetOption) {
+                    return;
+                  }
+
+                  option.voters.forEach((voter) => addVoterToOption(targetOption, voter));
+                });
+
+                return Array.from(optionMap.values());
+              };
+
+              const currentPollUpdates = pollOptions.map((option) => ({
                 name: option.optionName,
                 voters: selectedOptionNames.includes(option.optionName)
-                  ? [{ id: successfulVoterJid, name: successfulVoterName }]
+                  ? ([{ id: successfulVoterJid, name: successfulVoterName }] as PollVoter[])
                   : [],
               }));
 
-              messageRaw.pollUpdates = pollUpdates;
+              let consolidatedPollUpdates = currentPollUpdates;
+
+              try {
+                const previousPollUpdateRecords = await this.prismaRepository.messageUpdate.findMany({
+                  where: {
+                    instanceId: this.instanceId,
+                    keyId: pollCreationKey.id,
+                    status: 'POLL_UPDATE',
+                  },
+                  select: {
+                    pollUpdates: true,
+                  },
+                  orderBy: {
+                    id: 'asc',
+                  },
+                });
+
+                consolidatedPollUpdates = buildEmptyPollUpdates();
+
+                previousPollUpdateRecords.forEach((record) => {
+                  consolidatedPollUpdates = mergePollUpdates(consolidatedPollUpdates, record.pollUpdates);
+                });
+
+                consolidatedPollUpdates = mergePollUpdates(consolidatedPollUpdates, currentPollUpdates, {
+                  id: successfulVoterJid,
+                  name: successfulVoterName,
+                });
+              } catch (error) {
+                this.logger.warn([
+                  `Unable to consolidate poll updates for poll ${pollCreationKey.id}`,
+                  error?.message,
+                  error?.stack,
+                ]);
+              }
+
+              messageRaw.pollUpdates = consolidatedPollUpdates;
             }
           }
 
