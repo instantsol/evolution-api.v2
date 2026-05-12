@@ -2157,16 +2157,135 @@ export class BaileysStartupService extends ChannelStartupService {
       id: string;
       participants: string[];
       action: ParticipantAction;
+      author?: string;
+      authorPn?: string;
+      timestamp?: number;
     }) => {
       // ENHANCEMENT: Adds participantsData field while maintaining backward compatibility
       // MAINTAINS: participants: string[] (original JID strings)
       // ADDS: participantsData: { jid: string, phoneNumber: string, name?: string, imgUrl?: string }[]
       // This enables LID to phoneNumber conversion without breaking existing webhook consumers
 
-      // Helper to normalize participantId as phone number
       const normalizePhoneNumber = (id: string | null | undefined): string => {
-        // Remove @lid, @s.whatsapp.net suffixes and extract just the number part
-        return String(id || '').split('@')[0];
+        const localPart = String(id || '')
+          .trim()
+          .split('@')[0];
+        return localPart.replace(/:\d+$/, '');
+      };
+
+      const extractIncomingParticipantId = (value: any): string => {
+        if (typeof value === 'string' || typeof value === 'number') {
+          const normalized = String(value).trim();
+          return normalized.includes('[object Object]') ? '' : normalized;
+        }
+
+        if (!value || typeof value !== 'object') {
+          return '';
+        }
+
+        const direct = [value.jid, value.id, value.participant, value.participantJid, value.phoneJid]
+          .map((candidate) =>
+            typeof candidate === 'string' || typeof candidate === 'number' ? String(candidate).trim() : '',
+          )
+          .find(Boolean);
+        if (direct && !direct.includes('[object Object]')) {
+          return direct;
+        }
+
+        return '';
+      };
+
+      const lidToPhoneJidCache = new Map<string, string>();
+      const resolvePhoneJidFromLid = async (id: string | null | undefined): Promise<string | null> => {
+        const normalizedId = String(id || '').trim();
+        if (!normalizedId || !normalizedId.includes('@lid')) {
+          return null;
+        }
+
+        if (lidToPhoneJidCache.has(normalizedId)) {
+          return lidToPhoneJidCache.get(normalizedId) || null;
+        }
+
+        try {
+          const resolved = await this.client.signalRepository.lidMapping.getPNForLID(normalizedId);
+          const normalizedResolved = String(resolved || '').trim();
+          if (normalizedResolved) {
+            lidToPhoneJidCache.set(normalizedId, normalizedResolved);
+            return normalizedResolved;
+          }
+        } catch {
+          // Keep silent and fallback to raw LID-derived values
+        }
+
+        lidToPhoneJidCache.set(normalizedId, '');
+        return null;
+      };
+
+      const buildRemoteJidCandidates = async (id: string | null | undefined): Promise<string[]> => {
+        const normalizedId = String(id || '').trim();
+        const resolvedPhoneJid = await resolvePhoneJidFromLid(normalizedId);
+        const baseForNumber = resolvedPhoneJid || normalizedId;
+        const phoneNumber = normalizePhoneNumber(baseForNumber);
+
+        return Array.from(
+          new Set(
+            [
+              normalizedId,
+              resolvedPhoneJid || '',
+              phoneNumber ? `${phoneNumber}@s.whatsapp.net` : '',
+              phoneNumber ? `${phoneNumber}@lid` : '',
+            ].filter(Boolean),
+          ),
+        );
+      };
+
+      const eventTimestamp = Math.trunc(Date.now() / 1000);
+
+      const persistGroupParticipantsUpdate = async (groupParticipantsUpdate: any) => {
+        if (!this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+          return;
+        }
+
+        const authorId = String(groupParticipantsUpdate?.author || groupParticipantsUpdate?.authorPn || '').trim();
+        const participantIds = Array.isArray(groupParticipantsUpdate?.participants)
+          ? groupParticipantsUpdate.participants.map((participant) => String(participant || '').trim()).filter(Boolean)
+          : [];
+        const messageId = [
+          'group-participants.update',
+          groupParticipantsUpdate?.id || '',
+          groupParticipantsUpdate?.action || '',
+          authorId,
+          participantIds.join(','),
+          groupParticipantsUpdate?.timestamp || eventTimestamp,
+        ].join(':');
+
+        try {
+          await this.prismaRepository.message.create({
+            data: {
+              key: {
+                id: messageId,
+                remoteJid: groupParticipantsUpdate.id,
+                participant: authorId || undefined,
+                fromMe: false,
+              },
+              pushName:
+                groupParticipantsUpdate?.authorData?.name ||
+                groupParticipantsUpdate?.authorData?.phoneNumber ||
+                authorId ||
+                '',
+              participant: authorId || null,
+              messageType: 'groupParticipantsUpdate',
+              message: groupParticipantsUpdate,
+              messageTimestamp: Number(groupParticipantsUpdate?.timestamp || eventTimestamp),
+              instanceId: this.instanceId,
+              source: 'unknown',
+            },
+          });
+        } catch (error) {
+          this.logger.error(
+            `Failed to persist GROUP_PARTICIPANTS_UPDATE message: ${error.message} | Group: ${groupParticipantsUpdate?.id}`,
+          );
+        }
       };
 
       try {
@@ -2178,40 +2297,113 @@ export class BaileysStartupService extends ChannelStartupService {
           throw new Error('Invalid participant data received from findParticipants');
         }
 
-        // Filtra apenas os participantes que estão no evento
-        const resolvedParticipants = participantsUpdate.participants.map((participantId) => {
-          const participantData = groupParticipants.participants.find((p) => p.id === participantId);
-
-          let phoneNumber: string;
-          if (participantData?.phoneNumber) {
-            phoneNumber = participantData.phoneNumber;
-          } else {
-            phoneNumber = normalizePhoneNumber(participantId);
+        const participantLookupByPhone = new Map<string, (typeof groupParticipants.participants)[number]>();
+        const participantLookupByJid = new Map<string, (typeof groupParticipants.participants)[number]>();
+        groupParticipants.participants.forEach((participant) => {
+          const participantJid = String(participant?.id || '').trim();
+          if (participantJid) {
+            participantLookupByJid.set(participantJid, participant);
           }
+
+          const participantPhone = normalizePhoneNumber(participant?.phoneNumber || participant?.id);
+          if (participantPhone) {
+            participantLookupByPhone.set(participantPhone, participant);
+          }
+        });
+
+        const normalizedAuthorId = extractIncomingParticipantId(participantsUpdate.author);
+        const normalizedParticipantIds = Array.isArray(participantsUpdate.participants)
+          ? participantsUpdate.participants
+              .map((participant) => extractIncomingParticipantId(participant))
+              .filter(Boolean)
+          : [];
+        const authorPhone = normalizePhoneNumber(normalizedAuthorId);
+        const participantIdsWithoutAuthor =
+          normalizedParticipantIds.length > 1
+            ? normalizedParticipantIds.filter((participantId) => {
+                const participantPhone = normalizePhoneNumber(participantId);
+                return participantId !== normalizedAuthorId && participantPhone !== authorPhone;
+              })
+            : normalizedParticipantIds;
+        const safeParticipantIds = participantIdsWithoutAuthor.length
+          ? participantIdsWithoutAuthor
+          : normalizedParticipantIds;
+
+        const allParticipantIds = [normalizedAuthorId, ...safeParticipantIds].filter(Boolean);
+        const resolvedCandidates = await Promise.all(
+          allParticipantIds.map((participantId) => buildRemoteJidCandidates(participantId)),
+        );
+        const candidateRemoteJids = Array.from(new Set(resolvedCandidates.flat()));
+        const contacts = candidateRemoteJids.length
+          ? await this.prismaRepository.contact.findMany({
+              where: {
+                instanceId: this.instanceId,
+                remoteJid: { in: candidateRemoteJids },
+              },
+              select: {
+                remoteJid: true,
+                pushName: true,
+                kwik_contact_name: true,
+                profilePicUrl: true,
+              },
+            })
+          : [];
+        const contactLookup = new Map(contacts.map((contact) => [contact.remoteJid, contact]));
+
+        const resolveParticipantData = async (participantId: string) => {
+          const participantCandidates = await buildRemoteJidCandidates(participantId);
+          const normalizedParticipantId = normalizePhoneNumber(
+            participantCandidates[1] || participantCandidates[0] || participantId,
+          );
+          const participantData =
+            participantLookupByJid.get(String(participantId || '').trim()) ||
+            participantLookupByJid.get(participantCandidates[1] || '') ||
+            participantLookupByJid.get(participantCandidates[0] || '') ||
+            participantLookupByPhone.get(normalizedParticipantId);
+          const contactData = participantCandidates.map((candidate) => contactLookup.get(candidate)).find(Boolean);
 
           return {
             jid: participantId,
-            phoneNumber,
-            name: participantData?.name,
-            imgUrl: participantData?.imgUrl,
+            participantJid: participantCandidates[1] || participantCandidates[0] || participantId,
+            phoneNumber: participantData?.phoneNumber || normalizedParticipantId,
+            name: participantData?.name || contactData?.kwik_contact_name || contactData?.pushName,
+            imgUrl: participantData?.imgUrl || contactData?.profilePicUrl,
           };
-        });
+        };
+
+        // Filtra apenas os participantes que estão no evento
+        const resolvedParticipants = await Promise.all(
+          safeParticipantIds.map((participantId) => resolveParticipantData(participantId)),
+        );
+        const authorData = normalizedAuthorId ? await resolveParticipantData(normalizedAuthorId) : undefined;
 
         // Mantém formato original + adiciona dados resolvidos
         const enhancedParticipantsUpdate = {
           ...participantsUpdate,
-          participants: participantsUpdate.participants, // Mantém array original de strings
+          timestamp: participantsUpdate.timestamp || eventTimestamp,
+          author: normalizedAuthorId || participantsUpdate.author,
+          participants: safeParticipantIds, // Mantém compatibilidade e remove ids inválidos/autor indevido
           // Adiciona dados resolvidos em campo separado
           participantsData: resolvedParticipants,
+          authorData,
+          authorPn: participantsUpdate.authorPn || authorData?.phoneNumber,
         };
 
+        await persistGroupParticipantsUpdate(enhancedParticipantsUpdate);
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, enhancedParticipantsUpdate);
       } catch (error) {
         this.logger.error(
           `Failed to resolve participant data for GROUP_PARTICIPANTS_UPDATE webhook: ${error.message} | Group: ${participantsUpdate.id} | Participants: ${participantsUpdate.participants.length}`,
         );
         // Fallback - envia sem conversão
-        this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, participantsUpdate);
+        const fallbackParticipantsUpdate = {
+          ...participantsUpdate,
+          timestamp: participantsUpdate.timestamp || eventTimestamp,
+          authorPn: participantsUpdate.authorPn || normalizePhoneNumber(participantsUpdate.author),
+        };
+
+        await persistGroupParticipantsUpdate(fallbackParticipantsUpdate);
+        this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, fallbackParticipantsUpdate);
       }
 
       this.updateGroupMetadataCache(participantsUpdate.id);
