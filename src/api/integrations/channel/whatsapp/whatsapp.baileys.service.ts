@@ -363,6 +363,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.instance.qrcode.count++;
 
+      if (this.instance.qrcode.count > 1) {
+        this.logger.warn({
+          msg: 'QR code regenerated — previous QR expired or scan was rejected by WhatsApp',
+          instance: this.instance.name,
+          qrcodeCount: this.instance.qrcode.count,
+        });
+      }
+
       const color = this.configService.get<QrCode>('QRCODE').COLOR;
 
       const optsQrcode: QRCodeToDataURLOptions = {
@@ -424,12 +432,58 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      this.logger.warn({
+        msg: 'raw lastDisconnect',
+        lastDisconnect: JSON.stringify(lastDisconnect, Object.getOwnPropertyNames(lastDisconnect?.error ?? {})),
+        errorConstructor: lastDisconnect?.error?.constructor?.name,
+        isBoomInstance: lastDisconnect?.error instanceof Boom,
+        outputStatusCode: (lastDisconnect?.error as any)?.output?.statusCode,
+      });
+      const boomError = lastDisconnect?.error instanceof Boom ? (lastDisconnect.error as Boom) : null;
+      const statusCode = boomError?.output?.statusCode ?? (lastDisconnect?.error as any)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+
+      const disconnectReasonName = Object.entries(DisconnectReason).find(([, v]) => v === statusCode)?.[0] ?? 'unknown';
+      const disconnectDetails = {
+        instance: this.instance.name,
+        statusCode: statusCode ?? null,
+        reason: disconnectReasonName,
+        errorMessage: lastDisconnect?.error?.message ?? null,
+        errorPayload: boomError?.output?.payload ?? null,
+        disconnectDate: lastDisconnect?.date ?? null,
+      };
+
       if (shouldReconnect) {
+        this.logger.warn({ msg: 'Disconnected — reconnecting', ...disconnectDetails });
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+          instance: this.instance.name,
+          state: 'close',
+          reconnecting: true,
+          ...disconnectDetails,
+        });
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
+        const initiatedBy =
+          statusCode === DisconnectReason.loggedOut
+            ? 'user_logout'
+            : statusCode === DisconnectReason.forbidden || statusCode === 402 || statusCode === 406
+              ? 'server_rejected'
+              : 'error';
+        this.logger.error({
+          msg: 'Permanent disconnection — not reconnecting',
+          initiatedBy,
+          ...disconnectDetails,
+        });
+
+        const connectionUpdatePayload = {
+          instance: this.instance.name,
+          ...this.stateConnection,
+          ...disconnectDetails,
+        };
+        this.logger.warn({ msg: 'connectionUpdatePayload', connectionUpdatePayload });
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, connectionUpdatePayload);
+
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -459,8 +513,6 @@ export class BaileysStartupService extends ChannelStartupService {
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
-
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
       }
     }
 
@@ -1350,7 +1402,7 @@ export class BaileysStartupService extends ChannelStartupService {
                       if (decryptedVote) {
                         successfulVoterJid = voter;
                         this.logger.verbose(
-                          `DELETEME Poll vote decrypted using creator ${creator} and voter ${voter} for poll ${
+                          `Poll vote decrypted using creator ${creator} and voter ${voter} for poll ${
                             pollCreationKey.id || pollMessage.key.id
                           }`,
                         );
@@ -1367,7 +1419,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   Object.assign(pollVote, decryptedVote);
                 } else {
                   this.logger.warn(
-                    `DELETEME Unable to decrypt poll vote for poll ${
+                    `Unable to decrypt poll vote for poll ${
                       pollCreationKey.id || pollMessage.key.id
                     }. Creation key: ${JSON.stringify(pollCreationKey)}. Vote key: ${JSON.stringify(
                       received.key,
