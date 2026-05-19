@@ -45,23 +45,7 @@ export class WebsocketController extends EventController implements EventControl
             return callback(null, true);
           }
 
-          const apiKey = params.get('apikey') || (req.headers.apikey as string);
-
-          if (!apiKey) {
-            this.logger.error('Connection rejected: apiKey not provided');
-            return callback('apiKey is required', false);
-          }
-
-          const instance = await this.prismaRepository.instance.findFirst({ where: { token: apiKey } });
-
-          if (!instance) {
-            const globalToken = configService.get<Auth>('AUTHENTICATION').API_KEY.KEY;
-            if (apiKey !== globalToken) {
-              this.logger.error('Connection rejected: invalid global token');
-              return callback('Invalid global token', false);
-            }
-          }
-
+          // Authentication is handled in io.use() to support apikey via auth payload
           callback(null, true);
         } catch (error) {
           this.logger.error('Authentication error:');
@@ -69,6 +53,52 @@ export class WebsocketController extends EventController implements EventControl
           callback('Authentication error', false);
         }
       },
+    });
+
+    // Validate apikey from auth payload (preferred), query string (legacy) or header
+    this.socket.use(async (socket, next) => {
+      try {
+        const address = socket.handshake.address;
+        const websocketConfig = configService.get<Websocket>('WEBSOCKET');
+        const allowedHosts = websocketConfig.ALLOWED_HOSTS || '127.0.0.1,::1,::ffff:127.0.0.1';
+        const allowAllHosts = allowedHosts.trim() === '*';
+        const isAllowedHost =
+          allowAllHosts ||
+          allowedHosts
+            .split(',')
+            .map((h) => h.trim())
+            .includes(address);
+
+        if (isAllowedHost) {
+          return next();
+        }
+
+        const apiKey =
+          (socket.handshake.auth as Record<string, string>)?.apikey ||
+          (socket.handshake.query?.apikey as string) ||
+          (socket.handshake.headers?.apikey as string);
+
+        if (!apiKey) {
+          this.logger.error('Connection rejected: apiKey not provided');
+          return next(new Error('apiKey is required'));
+        }
+
+        const instance = await this.prismaRepository.instance.findFirst({ where: { token: apiKey } });
+
+        if (!instance) {
+          const globalToken = configService.get<Auth>('AUTHENTICATION').API_KEY.KEY;
+          if (apiKey !== globalToken) {
+            this.logger.error('Connection rejected: invalid global token');
+            return next(new Error('Invalid global token'));
+          }
+        }
+
+        next();
+      } catch (error) {
+        this.logger.error('Authentication error:');
+        this.logger.error(error);
+        next(new Error('Authentication error'));
+      }
     });
 
     this.socket.on('connection', (socket) => {
