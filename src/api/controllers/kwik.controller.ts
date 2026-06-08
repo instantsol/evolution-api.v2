@@ -555,8 +555,22 @@ export class KwikController {
     });
     const data = [];
 
+    const phoneSearch = String(query.text_search || '').replace(/\D/g, '');
+    const contactMatches =
+      phoneSearch.length >= 3
+        ? await this.prismaRepository.contact.findMany({
+            where: {
+              instanceId: { in: Object.keys(InstancesObject) },
+              remoteJid: { contains: phoneSearch, mode: 'insensitive' },
+            },
+            take: 100,
+          })
+        : [];
     const uniqueContacts = Array.from(
-      new Set(messages.filter((m) => !m.remotejid.includes('@g.us')).map((m) => `${m.instanceId}#${m.remotejid}`)),
+      new Set([
+        ...messages.filter((m) => !m.remotejid.includes('@g.us')).map((m) => `${m.instanceId}#${m.remotejid}`),
+        ...contactMatches.filter((c) => !c.remoteJid.includes('@g.us')).map((c) => `${c.instanceId}#${c.remoteJid}`),
+      ]),
     );
     const contacts_promises = uniqueContacts.map((m) => {
       return this.prismaRepository.contact.findFirst({
@@ -606,6 +620,24 @@ export class KwikController {
         conversation: `${InstancesObject[message.instanceId]}#${info}`,
         type: type,
         info: tinfo,
+      });
+    }
+
+    const messageConversationKeys = new Set(data.map((item) => item.conversation));
+    for (let i = 0; i < contactMatches.length; i++) {
+      const contact = contactMatches[i];
+      if (contact.remoteJid.includes('@g.us')) continue;
+
+      const info = contact.remoteJid.split('@');
+      const conversation = `${InstancesObject[contact.instanceId]}#${info}`;
+      if (messageConversationKeys.has(conversation)) continue;
+
+      data.push({
+        message: null,
+        owner: InstancesObject[contact.instanceId],
+        conversation,
+        type: 'CONTACT',
+        info: contact,
       });
     }
 
