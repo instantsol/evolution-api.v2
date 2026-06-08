@@ -286,5 +286,5 @@ export class KwikRouter extends RouterBroker {
       return res.status(HttpStatus.OK).json(response);
     });
   }
-  public readonly router = Router();
+  public readonly router: Router = Router();
 }

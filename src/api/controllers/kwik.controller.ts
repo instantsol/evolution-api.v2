@@ -795,10 +795,46 @@ export class KwikController {
       },
     });
 
-    const pollMessages = data.filter((item: any) => item?.messageType === 'pollCreationMessageV3' && item?.id);
+    const messageIds = data.map((item: any) => item?.id).filter((id: string) => Boolean(id));
+    const messageStatusRows = messageIds.length
+      ? await this.prismaRepository.message.findMany({
+          where: {
+            id: { in: messageIds },
+          },
+          select: {
+            id: true,
+            status: true,
+            MessageUpdate: {
+              select: {
+                keyId: true,
+                remoteJid: true,
+                fromMe: true,
+                participant: true,
+                status: true,
+              },
+            },
+          },
+        })
+      : [];
+    const messageStatusById = new Map(messageStatusRows.map((row: any) => [row.id, row]));
+    const enrichedData = data.map((item: any) => {
+      const statusRow = messageStatusById.get(item?.id);
+
+      if (!statusRow) {
+        return item;
+      }
+
+      return {
+        ...item,
+        status: statusRow.status,
+        MessageUpdate: statusRow.MessageUpdate || [],
+      };
+    });
+
+    const pollMessages = enrichedData.filter((item: any) => item?.messageType === 'pollCreationMessageV3' && item?.id);
 
     if (!pollMessages.length) {
-      return data;
+      return enrichedData;
     }
 
     const pollMessageIds = pollMessages.map((item: any) => item.id);
@@ -829,7 +865,7 @@ export class KwikController {
       }
     }
 
-    return data.map((item: any) => {
+    return enrichedData.map((item: any) => {
       if (item?.messageType !== 'pollCreationMessageV3') {
         return item;
       }

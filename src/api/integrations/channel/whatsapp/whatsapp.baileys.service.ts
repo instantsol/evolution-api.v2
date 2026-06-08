@@ -100,6 +100,7 @@ import makeWASocket, {
   ConnectionState,
   Contact,
   decryptPollVote,
+  decryptSecretEncryptedMessage,
   delay,
   DisconnectReason,
   downloadContentFromMessage,
@@ -119,6 +120,7 @@ import makeWASocket, {
   MessageUpsertType,
   MessageUserReceiptUpdate,
   MiscMessageGenerationOptions,
+  normalizeMessageContent,
   ParticipantAction,
   prepareWAMessageMedia,
   Product,
@@ -135,7 +137,7 @@ import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
@@ -572,39 +574,711 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private normalizeJidForMessageLookup(jid?: string | null) {
+    if (!jid) {
+      return null;
+    }
+
+    try {
+      return jidNormalizedUser(jid);
+    } catch {
+      return String(jid).trim().toLowerCase();
+    }
+  }
+
+  private areMessageJidsEquivalent(left?: string | null, right?: string | null) {
+    const normalizedLeft = this.normalizeJidForMessageLookup(left);
+    const normalizedRight = this.normalizeJidForMessageLookup(right);
+
+    return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
+  }
+
+  private normalizeMessageSecret(value: any): Buffer | undefined {
+    if (!value) return undefined;
+    if (Buffer.isBuffer(value)) return value;
+    if (value instanceof Uint8Array) return Buffer.from(value);
+    if (typeof value === 'string') return Buffer.from(value, 'base64');
+    if (Array.isArray(value)) return Buffer.from(value);
+    if (value?.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+
+    if (typeof value === 'object') {
+      const numericKeys = Object.keys(value).filter((key) => /^\d+$/.test(key));
+      if (numericKeys.length) {
+        return Buffer.from(numericKeys.sort((a, b) => Number(a) - Number(b)).map((key) => value[key]));
+      }
+    }
+
+    return undefined;
+  }
+
+  private hydrateMessageSecrets(message?: proto.IMessage | null): proto.IMessage | undefined {
+    if (!message) {
+      return undefined;
+    }
+
+    const normalizedMessage = this.deserializeMessageBuffers(message);
+    const messageSecret = this.normalizeMessageSecret(normalizedMessage?.messageContextInfo?.messageSecret);
+
+    if (messageSecret) {
+      normalizedMessage.messageContextInfo = {
+        ...normalizedMessage.messageContextInfo,
+        messageSecret,
+      };
+    }
+
+    return normalizedMessage;
+  }
+
+  private createMessageSecret() {
+    return randomBytes(32);
+  }
+
+  private getMessageSecretBase64(value: any): string | undefined {
+    const messageSecret = this.normalizeMessageSecret(value);
+    return messageSecret?.length ? Buffer.from(messageSecret).toString('base64') : undefined;
+  }
+
+  private ensureOutgoingMessageSecretContext(contextInfo?: any) {
+    const messageSecret = this.normalizeMessageSecret(contextInfo?.messageSecret) || this.createMessageSecret();
+
+    return {
+      ...(contextInfo || {}),
+      messageSecret,
+    };
+  }
+
+  private ensureOutgoingMessageSecret(message: any) {
+    const contextInfo = this.ensureOutgoingMessageSecretContext(message?.messageContextInfo || message?.contextInfo);
+
+    message.contextInfo = {
+      ...(message.contextInfo || {}),
+      messageSecret: contextInfo.messageSecret,
+    };
+
+    message.messageContextInfo = {
+      ...(message.messageContextInfo || {}),
+      messageSecret: contextInfo.messageSecret,
+    };
+
+    return message;
+  }
+
+  private ensureStoredMessageSecret(messageRaw: any) {
+    if (
+      !messageRaw?.key?.fromMe ||
+      messageRaw?.messageType === 'protocolMessage' ||
+      messageRaw?.messageType === 'editedMessage'
+    ) {
+      return messageRaw;
+    }
+
+    const existingSecret =
+      messageRaw?.message?.messageContextInfo?.messageSecret ||
+      messageRaw?.contextInfo?.messageSecret ||
+      messageRaw?.message?.extendedTextMessage?.contextInfo?.messageSecret;
+
+    const messageSecret = this.getMessageSecretBase64(existingSecret) || this.createMessageSecret().toString('base64');
+
+    messageRaw.message = {
+      ...(messageRaw.message || {}),
+      messageContextInfo: {
+        ...(messageRaw.message?.messageContextInfo || {}),
+        messageSecret,
+      },
+    };
+
+    messageRaw.contextInfo = {
+      ...(messageRaw.contextInfo || {}),
+      messageSecret,
+    };
+
+    return messageRaw;
+  }
+
+  private isMatchingMessageKey(storedKey: any, requestedKey: proto.IMessageKey) {
+    if (!storedKey?.id || storedKey.id !== requestedKey.id) {
+      return false;
+    }
+
+    const remoteMatches =
+      !requestedKey.remoteJid ||
+      this.areMessageJidsEquivalent(storedKey.remoteJid, requestedKey.remoteJid) ||
+      this.areMessageJidsEquivalent(storedKey.remoteJidAlt, requestedKey.remoteJid) ||
+      this.areMessageJidsEquivalent(storedKey.remoteJid, (requestedKey as ExtendedIMessageKey).remoteJidAlt) ||
+      this.areMessageJidsEquivalent(storedKey.remoteJidAlt, (requestedKey as ExtendedIMessageKey).remoteJidAlt);
+
+    if (!remoteMatches) {
+      return false;
+    }
+
+    if (
+      requestedKey.fromMe !== undefined &&
+      storedKey.fromMe !== undefined &&
+      storedKey.fromMe !== requestedKey.fromMe
+    ) {
+      return false;
+    }
+
+    const requestedParticipant = requestedKey.participant || (requestedKey as ExtendedIMessageKey).participantAlt;
+    if (!requestedParticipant) {
+      return true;
+    }
+
+    return (
+      this.areMessageJidsEquivalent(storedKey.participant, requestedParticipant) ||
+      this.areMessageJidsEquivalent(storedKey.participantAlt, requestedParticipant)
+    );
+  }
+
+  private isOriginalMessageRecord(message: any) {
+    const messageType = String(message?.messageType || '');
+    const payload = message?.message || {};
+
+    if (messageType === 'protocolMessage' || messageType === 'editedMessage') {
+      return false;
+    }
+
+    if (payload?.protocolMessage || payload?.editedMessage?.message?.protocolMessage) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private extractEditedMessageContent(editedMessage?: proto.IMessage): proto.IMessage | undefined {
+    if (!editedMessage) {
+      return undefined;
+    }
+
+    const nestedProtocolMessage =
+      (editedMessage as any)?.protocolMessage || (editedMessage as any)?.editedMessage?.message?.protocolMessage;
+
+    if (nestedProtocolMessage?.editedMessage) {
+      return nestedProtocolMessage.editedMessage as proto.IMessage;
+    }
+
+    return editedMessage;
+  }
+
+  private getEditedMessageContextInfo(originalMessage: any, editedMessage?: proto.IMessage) {
+    const editedMessageSecret =
+      (editedMessage as any)?.messageContextInfo?.messageSecret ||
+      (editedMessage as any)?.protocolMessage?.editedMessage?.messageContextInfo?.messageSecret ||
+      originalMessage?.message?.messageContextInfo?.messageSecret ||
+      originalMessage?.contextInfo?.messageSecret;
+
+    const messageSecret = this.getMessageSecretBase64(editedMessageSecret);
+
+    return {
+      ...(messageSecret ? { messageSecret } : {}),
+    };
+  }
+
+  private buildEditedHistoryMessage(originalMessage: any, editedOriginalData: any, editedMessage?: proto.IMessage) {
+    const messageContextInfo = this.getEditedMessageContextInfo(originalMessage, editedMessage);
+    const protocolKey = {
+      id: originalMessage?.key?.id,
+      oldid: originalMessage?.id,
+      fromMe: originalMessage?.key?.fromMe,
+      remoteJid: originalMessage?.key?.remoteJid,
+      ...(originalMessage?.key?.participant ? { participant: originalMessage.key.participant } : {}),
+    };
+
+    return {
+      protocolMessage: {
+        key: protocolKey,
+        type: proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
+        editedMessage: editedOriginalData.message,
+      },
+      ...(Object.keys(messageContextInfo).length ? { messageContextInfo } : {}),
+    };
+  }
+
+  private stableJsonStringify(value: any): string {
+    if (value === null || value === undefined) {
+      return JSON.stringify(value);
+    }
+
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stableJsonStringify(item)).join(',')}]`;
+    }
+
+    if (typeof value === 'object') {
+      return `{${Object.keys(value)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${this.stableJsonStringify(value[key])}`)
+        .join(',')}}`;
+    }
+
+    return JSON.stringify(value);
+  }
+
+  private stripMessageContextInfo(value: any): any {
+    if (value === null || value === undefined) {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((item) => this.stripMessageContextInfo(item));
+    }
+
+    if (typeof value === 'object') {
+      return Object.keys(value).reduce((result, key) => {
+        if (key !== 'messageContextInfo') {
+          result[key] = this.stripMessageContextInfo(value[key]);
+        }
+
+        return result;
+      }, {});
+    }
+
+    return value;
+  }
+
+  private areMessagesEquivalentIgnoringContext(left: any, right: any) {
+    return (
+      this.stableJsonStringify(this.stripMessageContextInfo(left)) ===
+      this.stableJsonStringify(this.stripMessageContextInfo(right))
+    );
+  }
+
+  private async findExistingEditedMessage(originalMessage: any, editedOriginalData: any) {
+    if (!originalMessage?.key?.id) {
+      return null;
+    }
+
+    const existingMessages = (await this.prismaRepository.$queryRaw`
+      SELECT "id", "message" FROM "Message"
+      WHERE "instanceId" = ${this.instanceId}
+      AND "messageType" = 'editedMessage'
+      AND "key"->>'id' = ${originalMessage.key.id}
+      AND (
+        "message"#>>'{protocolMessage,key,oldid}' = ${originalMessage.id}
+        OR "message"#>>'{protocolMessage,key,id}' = ${originalMessage.key.id}
+      )
+    `) as any[];
+
+    const nextEditedPayload = this.stableJsonStringify(editedOriginalData.message);
+
+    return (
+      existingMessages.find((message) => {
+        const existingEditedPayload = message?.message?.protocolMessage?.editedMessage;
+        return this.stableJsonStringify(existingEditedPayload) === nextEditedPayload;
+      }) || null
+    );
+  }
+
+  private async createEditedMessageRecordIfNeeded(
+    originalMessage: any,
+    editedOriginalData: any,
+    editedMessage?: proto.IMessage,
+  ) {
+    const existingMessage = await this.findExistingEditedMessage(originalMessage, editedOriginalData);
+
+    if (existingMessage) {
+      return null;
+    }
+
+    const { id: oldId, ...rawOriginalMessage } = originalMessage as any;
+    const rawEditedMessage = {
+      ...(rawOriginalMessage as any),
+      messageType: 'editedMessage',
+      message: this.buildEditedHistoryMessage(originalMessage, editedOriginalData, editedMessage),
+      messageTimestamp: editedOriginalData.messageTimestamp,
+      status: 'EDITED',
+    };
+
+    await this.prismaRepository.message.create({ data: rawEditedMessage });
+
+    return { rawEditedMessage, oldId };
+  }
+
+  private async createEditedMessageFromChangedSnapshot(messageRaw: any, source: string, requestId?: string) {
+    if (!messageRaw?.key?.id || !messageRaw.message) {
+      return false;
+    }
+
+    const oldMessage = await this.getMessage(messageRaw.key, true);
+    const oldMessageIsOriginal = oldMessage?.id && this.isOriginalMessageRecord(oldMessage);
+    const messageChanged =
+      oldMessageIsOriginal && !this.areMessagesEquivalentIgnoringContext(oldMessage.message, messageRaw.message);
+
+    if (!messageChanged) {
+      return false;
+    }
+
+    const editedOriginalData = this.buildEditedMessageUpdateData(
+      oldMessage,
+      messageRaw.message as proto.IMessage,
+      messageRaw.messageTimestamp,
+    );
+
+    if (!editedOriginalData) {
+      this.logger.warn(
+        `Changed message snapshot has no editable content. Key: ${JSON.stringify(messageRaw.key)} Source: ${source}`,
+      );
+      return false;
+    }
+
+    const createdEdit = await this.createEditedMessageRecordIfNeeded(
+      oldMessage,
+      editedOriginalData,
+      messageRaw.message as proto.IMessage,
+    );
+
+    await this.baileysCache.set(`edit_created_${messageRaw.key.id}`, true, 60 * 60);
+
+    if (createdEdit) {
+      await this.prismaRepository.messageUpdate.create({
+        data: {
+          fromMe: messageRaw.key.fromMe,
+          keyId: messageRaw.key.id,
+          remoteJid: messageRaw.key.remoteJid,
+          participant: messageRaw.key?.participant,
+          status: 'EDITED',
+          instanceId: this.instanceId,
+          messageId: createdEdit.oldId,
+        },
+      });
+      this.sendDataWebhook(Events.MESSAGES_UPSERT, createdEdit.rawEditedMessage);
+      this.logger.info(
+        `Created editedMessage from ${source} for original message ${messageRaw.key.id}${
+          requestId ? `. RequestId: ${requestId}` : ''
+        }`,
+      );
+    } else {
+      this.logger.info(
+        `EditedMessage already exists from ${source} for original message ${messageRaw.key.id}${
+          requestId ? `. RequestId: ${requestId}` : ''
+        }`,
+      );
+    }
+
+    return true;
+  }
+
+  private async createEditedMessageFromProtocolMessage(
+    protocolMessage: proto.Message.IProtocolMessage,
+    messageTimestamp: any,
+    source: string,
+  ) {
+    if (
+      protocolMessage?.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT ||
+      !protocolMessage?.key?.id ||
+      !protocolMessage?.editedMessage
+    ) {
+      return false;
+    }
+
+    const oldMessage = await this.getMessage(protocolMessage.key, true);
+
+    if (!oldMessage?.id) {
+      this.logger.warn(
+        `Original message not found for decrypted edited protocol message. Source: ${source}. Key: ${JSON.stringify(
+          protocolMessage.key,
+        )}`,
+      );
+      return false;
+    }
+
+    const editedOriginalData = this.buildEditedMessageUpdateData(
+      oldMessage,
+      protocolMessage.editedMessage as proto.IMessage,
+      messageTimestamp,
+    );
+
+    if (!editedOriginalData) {
+      this.logger.warn(
+        `Decrypted edited protocol message has no editable content. Source: ${source}. Key: ${JSON.stringify(
+          protocolMessage.key,
+        )}`,
+      );
+      return false;
+    }
+
+    const createdEdit = await this.createEditedMessageRecordIfNeeded(
+      oldMessage,
+      editedOriginalData,
+      protocolMessage.editedMessage as proto.IMessage,
+    );
+
+    await this.baileysCache.set(`edit_created_${protocolMessage.key.id}`, true, 60 * 60);
+
+    if (createdEdit) {
+      await this.prismaRepository.messageUpdate.create({
+        data: {
+          fromMe: protocolMessage.key.fromMe,
+          keyId: protocolMessage.key.id,
+          remoteJid: protocolMessage.key.remoteJid,
+          participant: protocolMessage.key?.participant,
+          status: 'EDITED',
+          instanceId: this.instanceId,
+          messageId: createdEdit.oldId,
+        },
+      });
+      this.sendDataWebhook(Events.MESSAGES_UPSERT, createdEdit.rawEditedMessage);
+      this.logger.info(
+        `Created editedMessage from ${source} protocol message for original message ${protocolMessage.key.id}`,
+      );
+    }
+
+    return true;
+  }
+
+  private async decryptSecretEncryptedMessageIfNeeded(message: WAMessage, source: string) {
+    const content = normalizeMessageContent(message.message);
+    const secretEncryptedMessage = content?.secretEncryptedMessage;
+
+    if (!secretEncryptedMessage) {
+      return false;
+    }
+
+    const targetMessageKey = secretEncryptedMessage.targetMessageKey;
+    const originalMessage = targetMessageKey?.id
+      ? ((await this.getMessage(targetMessageKey)) as proto.IMessage)
+      : undefined;
+    const messageSecret =
+      this.normalizeMessageSecret(originalMessage?.messageContextInfo?.messageSecret) ||
+      this.normalizeMessageSecret(content?.messageContextInfo?.messageSecret);
+
+    if (!messageSecret?.length) {
+      this.logger.warn(
+        `Unable to decrypt secretEncryptedMessage from ${source}: missing original messageSecret. Target: ${JSON.stringify(
+          targetMessageKey,
+        )}. Envelope: ${JSON.stringify(message.key)}`,
+      );
+      return true;
+    }
+
+    const creds = this.instance.authState?.state?.creds;
+    await decryptSecretEncryptedMessage(
+      message,
+      messageSecret,
+      creds?.me?.id,
+      creds?.me?.lid,
+      P({ level: this.logBaileys }) as any,
+    );
+
+    if (normalizeMessageContent(message.message)?.secretEncryptedMessage) {
+      this.logger.warn(
+        `Dropping undecrypted secretEncryptedMessage from ${source}. Target: ${JSON.stringify(
+          targetMessageKey,
+        )}. Envelope: ${JSON.stringify(message.key)}`,
+      );
+      return true;
+    }
+
+    this.logger.info(
+      `Decrypted secretEncryptedMessage from ${source}. Target: ${JSON.stringify(targetMessageKey)}. Envelope: ${JSON.stringify(
+        message.key,
+      )}`,
+    );
+    return false;
+  }
+
+  private getOnDemandHistoryKeyCandidates(updateKey: proto.IMessageKey, originalMessage: any) {
+    const candidates: proto.IMessageKey[] = [];
+    const originalKey = originalMessage?.key || {};
+    const originalId = originalKey.id || updateKey?.id;
+    const fromMe = originalKey.fromMe ?? updateKey?.fromMe;
+
+    const pushCandidate = (remoteJid?: string | null, label?: string) => {
+      if (!remoteJid || !originalId) {
+        return;
+      }
+
+      const candidate = {
+        ...originalKey,
+        id: originalId,
+        fromMe,
+        remoteJid,
+        ...(originalKey.participant ? { participant: originalKey.participant } : {}),
+      } as proto.IMessageKey;
+
+      const duplicate = candidates.some((item) => {
+        const itemParticipant = (item as any).participant;
+        const candidateParticipant = (candidate as any).participant;
+        const participantMatches =
+          (!itemParticipant && !candidateParticipant) ||
+          this.areMessageJidsEquivalent(itemParticipant, candidateParticipant);
+
+        return (
+          item.id === candidate.id &&
+          item.fromMe === candidate.fromMe &&
+          this.areMessageJidsEquivalent(item.remoteJid, candidate.remoteJid) &&
+          participantMatches
+        );
+      });
+
+      if (!duplicate) {
+        (candidate as any).__requestLabel = label;
+        candidates.push(candidate);
+      }
+    };
+
+    pushCandidate(updateKey?.remoteJid, 'update-key');
+    pushCandidate((updateKey as ExtendedIMessageKey)?.remoteJidAlt, 'update-key-alt');
+    pushCandidate(originalKey.remoteJid, 'original-key');
+    pushCandidate(originalKey.remoteJidAlt, 'original-key-alt');
+
+    return candidates;
+  }
+
+  private getOriginalMessageCacheKey(messageId?: string | null) {
+    return messageId ? `original_message_${this.instanceId}_${messageId}` : null;
+  }
+
+  private async cacheOriginalMessageForSecretDecrypt(messageRaw: any) {
+    if (!this.isOriginalMessageRecord(messageRaw) || !messageRaw?.key?.id || !messageRaw?.message) {
+      return;
+    }
+
+    const cacheKey = this.getOriginalMessageCacheKey(messageRaw.key.id);
+    if (cacheKey) {
+      await this.baileysCache.set(cacheKey, messageRaw, 60 * 60 * 24);
+    }
+  }
+
+  private async findRecentOriginalMessageForEnvelope(key: proto.IMessageKey) {
+    if (!key?.id || !key.fromMe) {
+      return null;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const recentMessages = (await this.prismaRepository.$queryRaw`
+      SELECT * FROM "Message"
+      WHERE "instanceId" = ${this.instanceId}
+      AND "key"->>'fromMe' = 'true'
+      AND "key"->>'id' <> ${key.id}
+      AND "messageType" NOT IN ('protocolMessage', 'editedMessage')
+      AND "messageTimestamp" >= ${now - 15 * 60}
+      ORDER BY "messageTimestamp" DESC
+      LIMIT 10
+    `) as any[];
+
+    if (!recentMessages.length) {
+      return null;
+    }
+
+    const matchingMessage = recentMessages.find((message) => this.isMatchingMessageKey(message.key, key));
+    const fallbackMessage = matchingMessage || recentMessages[0];
+
+    if (fallbackMessage?.key?.id) {
+      await this.baileysCache.set(`protocol_${key.id}`, fallbackMessage.key.id, 60 * 60 * 24);
+      this.logger.warn(
+        `Mapped unknown outgoing edit/status envelope ${key.id} to recent original message ${fallbackMessage.key.id}. Key: ${JSON.stringify(
+          key,
+        )}`,
+      );
+    }
+
+    return fallbackMessage || null;
+  }
+
   private async getMessage(key: proto.IMessageKey, full = false) {
     try {
-      // Use raw SQL to avoid JSON path issues
+      if (!key?.id) {
+        this.logger.warn(`Baileys getMessage called without message id: ${JSON.stringify(key)}`);
+        return undefined;
+      }
+
+      const mappedMessageId = (await this.baileysCache.get(`protocol_${key.id}`)) as string;
+      const lookupMessageId = mappedMessageId || key.id;
+
       const webMessageInfo = (await this.prismaRepository.$queryRaw`
         SELECT * FROM "Message"
         WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'id' = ${key.id}
-      `) as proto.IWebMessageInfo[];
+        AND "key"->>'id' = ${lookupMessageId}
+        ORDER BY "messageTimestamp" DESC
+      `) as any[];
 
-      if (full) {
-        return webMessageInfo[0];
-      }
+      if (!webMessageInfo.length) {
+        const cacheKey = this.getOriginalMessageCacheKey(lookupMessageId);
+        const cachedMessage = cacheKey ? await this.baileysCache.get(cacheKey) : null;
 
-      if (webMessageInfo[0].message?.pollCreationMessage || webMessageInfo[0].message?.pollCreationMessageV3) {
-        const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
+        if (cachedMessage?.message) {
+          if (full) {
+            return cachedMessage;
+          }
 
-        if (typeof messageSecretBase64 === 'string') {
-          const messageSecret = Buffer.from(messageSecretBase64, 'base64');
-
-          const msg = {
-            messageContextInfo: { messageSecret },
-            pollCreationMessage: webMessageInfo[0].message?.pollCreationMessage,
-            pollCreationMessageV3: webMessageInfo[0].message?.pollCreationMessageV3,
-          };
-
-          return msg;
+          return this.hydrateMessageSecrets(cachedMessage.message);
         }
       }
 
-      return webMessageInfo[0].message;
-    } catch {
-      return { conversation: '' };
+      const candidateMessages = webMessageInfo.length
+        ? webMessageInfo
+        : [await this.findRecentOriginalMessageForEnvelope(key)].filter((message) => message);
+
+      const matchingMessages = candidateMessages.filter((message) => this.isMatchingMessageKey(message.key, key));
+      const storedMessage =
+        matchingMessages.find((message) => this.isOriginalMessageRecord(message)) ||
+        candidateMessages.find((message) => this.isOriginalMessageRecord(message)) ||
+        matchingMessages[0] ||
+        candidateMessages[0];
+
+      if (!storedMessage) {
+        this.logger.warn(
+          `Original Baileys message not found for key: ${JSON.stringify(key)}${
+            mappedMessageId ? ` mappedTo: ${mappedMessageId}` : ''
+          }`,
+        );
+        return undefined;
+      }
+
+      if (full) {
+        return storedMessage;
+      }
+
+      const originalMessage = this.hydrateMessageSecrets(storedMessage.message);
+      const messageSecret = originalMessage?.messageContextInfo?.messageSecret;
+
+      if (
+        storedMessage.messageType !== 'pollUpdateMessage' &&
+        !messageSecret &&
+        (originalMessage?.pollCreationMessage || originalMessage?.pollCreationMessageV3)
+      ) {
+        this.logger.warn(`Original poll message ${key.id} was found without messageSecret.`);
+      }
+
+      return originalMessage;
+    } catch (error) {
+      this.logger.warn(`Unable to load original Baileys message ${key?.id}: ${error?.message || error}`);
+      return undefined;
     }
+  }
+
+  private buildEditedMessageUpdateData(originalMessage: any, editedMessage?: proto.IMessage, messageTimestamp?: any) {
+    const editableMessage = this.extractEditedMessageContent(editedMessage);
+
+    if (!originalMessage?.key || !editableMessage) {
+      return null;
+    }
+
+    const editedMessageKeys = Object.keys(editableMessage as any).filter((key) => key !== 'messageContextInfo');
+
+    if (!editedMessageKeys.length) {
+      return null;
+    }
+
+    const normalizedTimestamp = Long.isLong(messageTimestamp)
+      ? Math.floor(messageTimestamp.toNumber())
+      : Math.floor((messageTimestamp as number) || originalMessage.messageTimestamp || Date.now() / 1000);
+
+    const preparedMessage = this.prepareMessage({
+      key: originalMessage.key,
+      pushName: originalMessage.pushName,
+      message: editableMessage,
+      messageTimestamp: normalizedTimestamp,
+      status: originalMessage.status as any,
+    } as proto.IWebMessageInfo);
+
+    return {
+      message: preparedMessage.message,
+      contextInfo: preparedMessage.contextInfo,
+      messageType: preparedMessage.messageType,
+      messageTimestamp: normalizedTimestamp,
+      status: 'EDITED',
+    };
   }
 
   private async defineAuthState() {
@@ -700,7 +1374,7 @@ export class BaileysStartupService extends ChannelStartupService {
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
-      getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
+      getMessage: async (key) => (await this.getMessage(key)) as proto.IMessage | undefined,
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 350,
@@ -1091,13 +1765,19 @@ export class BaileysStartupService extends ChannelStartupService {
           if (m.messageTimestamp <= timestampLimitToImport) {
             continue;
           }
+
+          const dropSecretEncryptedMessage = await this.decryptSecretEncryptedMessageIfNeeded(
+            m,
+            syncType === proto.HistorySync.HistorySyncType.ON_DEMAND ? 'on-demand history set' : 'history set',
+          );
+
+          if (dropSecretEncryptedMessage) {
+            continue;
+          }
+
           // if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
 
           // }
-
-          if (messagesRepository?.has(m.key.id)) {
-            continue;
-          }
 
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
@@ -1108,7 +1788,38 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          messagesRaw.push(this.prepareMessage(m));
+          const messageRaw = this.prepareMessage(m);
+          await this.cacheOriginalMessageForSecretDecrypt(messageRaw);
+
+          const historyProtocolMessage =
+            (messageRaw.message as any)?.protocolMessage ||
+            (messageRaw.message as any)?.editedMessage?.message?.protocolMessage;
+
+          if (historyProtocolMessage?.editedMessage) {
+            const handledProtocolEdit = await this.createEditedMessageFromProtocolMessage(
+              historyProtocolMessage,
+              messageRaw.messageTimestamp,
+              syncType === proto.HistorySync.HistorySyncType.ON_DEMAND ? 'on-demand history set' : 'history set',
+            );
+
+            if (handledProtocolEdit) {
+              continue;
+            }
+          }
+
+          if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
+            const handledEdit = await this.createEditedMessageFromChangedSnapshot(messageRaw, 'on-demand history set');
+
+            if (handledEdit) {
+              continue;
+            }
+          }
+
+          if (messagesRepository?.has(m.key.id)) {
+            continue;
+          }
+
+          messagesRaw.push(messageRaw);
         }
 
         this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
@@ -1197,10 +1908,30 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const editedMessage =
+          const protocolMessage =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          const protocolOnlyMessage =
+            protocolMessage &&
+            !protocolMessage?.editedMessage &&
+            !Object.keys(received?.message || {}).some(
+              (key) => !['protocolMessage', 'messageContextInfo', 'senderKeyDistributionMessage'].includes(key),
+            );
+          const deletedProtocolMessage = protocolOnlyMessage ? protocolMessage : undefined;
+          const editedMessage = deletedProtocolMessage
+            ? undefined
+            : received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
+            // Dedup: multiple upsert events (notify + append) can arrive for the same edit envelope.
+            // Use the envelope's own key as the dedup guard since it is unique per edit action.
+            const editEnvelopeKey = `${this.instance.id}_${received.key.id}`;
+            const editEnvelopeCached = await this.baileysCache.get(editEnvelopeKey);
+            if (editEnvelopeCached) {
+              this.logger.info(`Edit envelope duplicated ignored: ${received.key.id}`);
+              continue;
+            }
+            await this.baileysCache.set(editEnvelopeKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
               this.chatwootService.eventWhatsapp(
                 'messages.edit',
@@ -1219,42 +1950,91 @@ export class BaileysStartupService extends ChannelStartupService {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
                 ? Math.floor(received?.messageTimestamp.toNumber())
                 : Math.floor(received?.messageTimestamp as number);
+              const editedOriginalData = this.buildEditedMessageUpdateData(
+                oldMessage,
+                editedMessage.editedMessage as proto.IMessage,
+                editedMessageTimestamp,
+              );
 
-              const { id, ...rawOldMessage } = oldMessage as any;
-              const rawMessage = {
-                ...(rawOldMessage as any),
-                messageType: 'editedMessage',
-                message: {
-                  ...(editedMessage.editedMessage as any),
-                  protocolMessage: { key: { id: (rawOldMessage as any).key.id, oldid: id } },
-                },
-                messageTimestamp: editedMessageTimestamp,
-                status: 'EDITED',
-              };
-              await this.prismaRepository.message.create({
-                //where: { id: (oldMessage as any).id },
-                data: rawMessage,
-              });
-              await this.prismaRepository.messageUpdate.create({
-                data: {
-                  fromMe: editedMessage.key.fromMe,
-                  keyId: editedMessage.key.id,
-                  remoteJid: editedMessage.key.remoteJid,
-                  status: 'EDITED',
-                  instanceId: this.instanceId,
-                  messageId: (oldMessage as any).id,
-                },
-              });
-              this.sendDataWebhook(Events.MESSAGES_UPSERT, rawMessage);
+              if (!editedOriginalData) {
+                this.logger.warn(
+                  `Edited message ${editedMessage.key?.id} received without renderable edited content. Original key: ${JSON.stringify(
+                    editedMessage.key,
+                  )}`,
+                );
+                continue;
+              }
+
+              const createdEdit = await this.createEditedMessageRecordIfNeeded(
+                oldMessage,
+                editedOriginalData,
+                editedMessage.editedMessage as proto.IMessage,
+              );
+
+              // Mark edit as already handled so messages.update won't duplicate it.
+              await this.baileysCache.set(`edit_created_${editedMessage.key.id}`, true, 60 * 60);
+
+              if (createdEdit) {
+                await this.prismaRepository.messageUpdate.create({
+                  data: {
+                    fromMe: editedMessage.key.fromMe,
+                    keyId: editedMessage.key.id,
+                    remoteJid: editedMessage.key.remoteJid,
+                    status: 'EDITED',
+                    instanceId: this.instanceId,
+                    messageId: createdEdit.oldId,
+                  },
+                });
+                this.sendDataWebhook(Events.MESSAGES_UPSERT, createdEdit.rawEditedMessage);
+              }
+            } else {
+              this.logger.warn(
+                `Original message not found for edited message. Edit key: ${JSON.stringify(
+                  editedMessage.key,
+                )}. Envelope key: ${JSON.stringify(received.key)}`,
+              );
             }
+          }
+
+          if (
+            received.message?.secretEncryptedMessage ||
+            getContentType(received.message) === 'secretEncryptedMessage'
+          ) {
+            this.logger.warn(
+              `Dropping undecrypted secretEncryptedMessage before normal message flow. Key: ${JSON.stringify(
+                received.key,
+              )}`,
+            );
+            continue;
           }
 
           const messageKey = `${this.instance.id}_${received.key.id}`;
           const cached = await this.baileysCache.get(messageKey);
 
-          if (cached && !editedMessage && !requestId) {
+          if (cached && !editedMessage && !deletedProtocolMessage && !requestId) {
             this.logger.info(`Message duplicated ignored: ${received.key.id}`);
             continue;
+          }
+
+          if (deletedProtocolMessage) {
+            const deletedProtocolKey = deletedProtocolMessage.key as proto.IMessageKey & { oldid?: string };
+            const deleteMessageKey = [
+              this.instance.id,
+              'delete',
+              deletedProtocolKey.id || received.key.id,
+              deletedProtocolKey.oldid || '',
+              deletedProtocolKey.remoteJid || received.key.remoteJid || '',
+              deletedProtocolKey.participant || received.key.participant || '',
+              String(deletedProtocolKey.fromMe ?? received.key.fromMe ?? ''),
+            ].join('_');
+            const deleteCached = await this.baileysCache.get(deleteMessageKey);
+
+            if (deleteCached) {
+              this.logger.info(`Deleted message duplicated ignored: ${deletedProtocolKey.id || received.key.id}`);
+              continue;
+            }
+
+            await this.baileysCache.set(deleteMessageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
           }
 
           await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
@@ -1298,6 +2078,49 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageRaw = this.prepareMessage(received);
+
+          if (deletedProtocolMessage) {
+            const deletedKey = {
+              ...(deletedProtocolMessage.key || {}),
+              id: deletedProtocolMessage.key?.id || received.key.id,
+              fromMe: deletedProtocolMessage.key?.fromMe ?? received.key.fromMe,
+              remoteJid: deletedProtocolMessage.key?.remoteJid || received.key.remoteJid,
+              ...(deletedProtocolMessage.key?.participant || received.key.participant
+                ? { participant: deletedProtocolMessage.key?.participant || received.key.participant }
+                : {}),
+            };
+
+            messageRaw.key = {
+              ...messageRaw.key,
+              id: deletedKey.id,
+              fromMe: deletedKey.fromMe,
+              remoteJid: deletedKey.remoteJid,
+              ...(deletedKey.participant ? { participant: deletedKey.participant } : {}),
+            };
+            messageRaw.messageType = 'editedMessage';
+            messageRaw.status = 'DELETED';
+            messageRaw.message = {
+              protocolMessage: {
+                key: deletedKey,
+                type: deletedProtocolMessage.type ?? 0,
+              },
+              deleted: true,
+            };
+          }
+
+          await this.cacheOriginalMessageForSecretDecrypt(messageRaw);
+
+          if (requestId && messageRaw.key?.id && messageRaw.message) {
+            const handledEdit = await this.createEditedMessageFromChangedSnapshot(
+              messageRaw,
+              'on-demand history sync',
+              requestId,
+            );
+
+            if (handledEdit) {
+              continue;
+            }
+          }
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;
@@ -2024,6 +2847,13 @@ export class BaileysStartupService extends ChannelStartupService {
             message.message = update.message;
           }
 
+          const editedMessageContent =
+            (update.message as any)?.editedMessage?.message || (update.message as any)?.protocolMessage?.editedMessage;
+
+          if (editedMessageContent) {
+            message.status = 'EDITED';
+          }
+
           let findMessage: any;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
@@ -2037,19 +2867,102 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const searchId = originalMessageId || key.id;
 
-            const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
-              WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${searchId}
-              LIMIT 1
-            `) as any[];
-            findMessage = messages[0] || null;
+            findMessage = await this.getMessage({ ...key, id: searchId }, true);
 
             if (!findMessage?.id) {
               this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
               continue;
             }
+
+            if (findMessage.key?.id && findMessage.key.id !== key.id) {
+              message.keyId = findMessage.key.id;
+            }
+
             message.messageId = findMessage.id;
+
+            if (!editedMessageContent && findMessage.key?.id && findMessage.key.id !== key.id && key.fromMe) {
+              const syncCacheKey = `edit_history_sync_${key.id}`;
+              const alreadyRequested = await this.baileysCache.get(syncCacheKey);
+
+              if (!alreadyRequested) {
+                await this.baileysCache.set(syncCacheKey, true, 60 * 60);
+
+                this.client
+                  .requestPlaceholderResend(key)
+                  .then((requestId) => {
+                    this.logger.info(
+                      `Requested placeholder resend for outgoing edit envelope ${key.id} mapped to ${
+                        findMessage.key.id
+                      }. RequestId: ${requestId || 'pending'}`,
+                    );
+                  })
+                  .catch((error) => {
+                    this.logger.warn(
+                      `Unable to request placeholder resend for outgoing edit envelope ${key.id}: ${
+                        error?.message || error
+                      }`,
+                    );
+                  });
+
+                const historyKeyCandidates = this.getOnDemandHistoryKeyCandidates(key, findMessage);
+
+                for (const historyKey of historyKeyCandidates) {
+                  const requestLabel = (historyKey as any).__requestLabel;
+                  delete (historyKey as any).__requestLabel;
+
+                  try {
+                    const requestId = await this.client.fetchMessageHistory(
+                      25,
+                      historyKey,
+                      findMessage.messageTimestamp,
+                    );
+                    this.logger.info(
+                      `Requested on-demand history sync for outgoing edit envelope ${key.id} mapped to ${
+                        findMessage.key.id
+                      } using ${requestLabel || 'candidate'} ${JSON.stringify(historyKey)}. RequestId: ${requestId}`,
+                    );
+                  } catch (error) {
+                    this.logger.warn(
+                      `Unable to request on-demand history sync for outgoing edit envelope ${key.id} using ${
+                        requestLabel || 'candidate'
+                      } ${JSON.stringify(historyKey)}: ${error?.message || error}`,
+                    );
+                  }
+                }
+              }
+            }
+
+            if (editedMessageContent) {
+              const editedOriginalData = this.buildEditedMessageUpdateData(
+                findMessage,
+                editedMessageContent as proto.IMessage,
+                update.messageTimestamp,
+              );
+
+              if (editedOriginalData) {
+                // Keep the original message intact — do NOT overwrite it.
+                // Only create the editedMessage record if messages.upsert hasn't done it yet
+                // (received edits come through upsert first; sent-only edits come here exclusively).
+                const editDedupKey = `edit_created_${key.id}`;
+                const alreadyCreated = await this.baileysCache.get(editDedupKey);
+
+                if (!alreadyCreated) {
+                  const createdEdit = await this.createEditedMessageRecordIfNeeded(
+                    findMessage,
+                    editedOriginalData,
+                    editedMessageContent as proto.IMessage,
+                  );
+
+                  if (createdEdit) {
+                    this.sendDataWebhook(Events.MESSAGES_UPSERT, createdEdit.rawEditedMessage);
+                  }
+
+                  await this.baileysCache.set(editDedupKey, true, 60 * 60);
+                }
+              } else {
+                this.logger.warn(`Edited message update has no editable content. Key: ${JSON.stringify(key)}`);
+              }
+            }
           }
 
           if (update.message === null && update.status === undefined) {
@@ -2794,6 +3707,10 @@ export class BaileysStartupService extends ChannelStartupService {
       message['contextInfo'] = contextInfo;
     }
 
+    if (!message['edit'] && !message['reactionMessage'] && sender !== 'status@broadcast') {
+      this.ensureOutgoingMessageSecret(message);
+    }
+
     if (message['conversation']) {
       return await this.client.sendMessage(
         sender,
@@ -2802,6 +3719,7 @@ export class BaileysStartupService extends ChannelStartupService {
           mentions,
           linkPreview: linkPreview,
           contextInfo: message['contextInfo'],
+          messageContextInfo: message['messageContextInfo'],
         } as unknown as AnyMessageContent,
         option as unknown as MiscMessageGenerationOptions,
       );
@@ -2814,7 +3732,8 @@ export class BaileysStartupService extends ChannelStartupService {
           forward: { key: { remoteJid: this.instance.wuid, fromMe: true }, message },
           mentions,
           contextInfo: message['contextInfo'],
-        },
+          messageContextInfo: message['messageContextInfo'],
+        } as unknown as AnyMessageContent,
         option as unknown as MiscMessageGenerationOptions,
       );
     }
@@ -3023,6 +3942,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const messageRaw = this.prepareMessage(messageSent);
+      await this.cacheOriginalMessageForSecretDecrypt(messageRaw);
 
       const isMedia =
         messageSent?.message?.imageMessage ||
@@ -3442,8 +4362,9 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const response = await axios.get(mediaMessage.media, config);
+          const contentType = response.headers['content-type'];
 
-          mimetype = response.headers['content-type'];
+          mimetype = typeof contentType === 'string' ? contentType : false;
         }
       }
 
@@ -4806,6 +5727,18 @@ export class BaileysStartupService extends ChannelStartupService {
           messageSent?.message?.protocolMessage || messageSent?.message?.editedMessage?.message?.protocolMessage;
 
         if (editedMessage) {
+          if (messageSent.key?.id && editedMessage.key?.id) {
+            await this.baileysCache.set(`protocol_${messageSent.key.id}`, editedMessage.key.id, 60 * 60 * 24);
+
+            const originalCacheKey = this.getOriginalMessageCacheKey(editedMessage.key.id);
+            const envelopeCacheKey = this.getOriginalMessageCacheKey(messageSent.key.id);
+            const originalCachedMessage = originalCacheKey ? await this.baileysCache.get(originalCacheKey) : null;
+
+            if (envelopeCacheKey && originalCachedMessage) {
+              await this.baileysCache.set(envelopeCacheKey, originalCachedMessage, 60 * 60 * 24);
+            }
+          }
+
           this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
             this.chatwootService.eventWhatsapp(
@@ -4814,38 +5747,40 @@ export class BaileysStartupService extends ChannelStartupService {
               editedMessage,
             );
 
-          const messageId = messageSent.message?.protocolMessage?.key?.id;
+          const messageId = editedMessage.key?.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-            let message = await this.prismaRepository.message.findFirst({
-              where: { key: { path: ['id'], equals: messageId } },
-            });
-            if (!message) throw new NotFoundException('Message not found');
+            if (!oldMessage) throw new NotFoundException('Message not found');
 
-            if (!(message.key.valueOf() as any).fromMe) {
-              new BadRequestException('You cannot edit others messages');
+            if (!(oldMessage.key.valueOf() as any).fromMe) {
+              throw new BadRequestException('You cannot edit others messages');
             }
-            if ((message.key.valueOf() as any)?.deleted) {
-              new BadRequestException('You cannot edit deleted messages');
+            if ((oldMessage.key.valueOf() as any)?.deleted) {
+              throw new BadRequestException('You cannot edit deleted messages');
             }
 
-            if (oldMessage.messageType === 'conversation' || oldMessage.messageType === 'extendedTextMessage') {
-              oldMessage.message.conversation = data.text;
-            } else {
-              oldMessage.message[oldMessage.messageType].caption = data.text;
-            }
-            message = await this.prismaRepository.message.create({
-              //where: { id: message.id },
-              data: {
-                ...message,
-                message: oldMessage.message,
-                status: 'EDITED',
-                messageTimestamp: Math.floor(Date.now() / 1000), // Convert to int32 by dividing by 1000 to get seconds
-              },
-            });
+            const editedMessageTimestamp = Long.isLong(messageSent.messageTimestamp)
+              ? Math.floor(messageSent.messageTimestamp.toNumber())
+              : Math.floor((messageSent.messageTimestamp as number) || Date.now() / 1000);
+            const editedOriginalData = this.buildEditedMessageUpdateData(
+              oldMessage,
+              editedMessage.editedMessage as proto.IMessage,
+              editedMessageTimestamp,
+            );
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+            if (!editedOriginalData) {
+              this.logger.warn(`Sent edited message ${messageId} has no editable content.`);
+              return messageSent;
+            }
+
+            const createdEdit = await this.createEditedMessageRecordIfNeeded(
+              oldMessage,
+              editedOriginalData,
+              editedMessage.editedMessage as proto.IMessage,
+            );
+
+            if (createdEdit && this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
               const messageUpdate: any = {
-                messageId: message.id,
+                messageId: createdEdit.oldId,
                 keyId: messageId,
                 remoteJid: messageSent.key.remoteJid,
                 fromMe: messageSent.key.fromMe,
@@ -5321,6 +6256,8 @@ export class BaileysStartupService extends ChannelStartupService {
         delete quotedMessage.documentWithCaptionMessage;
       }
     }
+
+    this.ensureStoredMessageSecret(messageRaw);
 
     return messageRaw;
   }
