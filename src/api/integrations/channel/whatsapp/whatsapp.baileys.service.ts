@@ -2017,7 +2017,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (deletedProtocolMessage) {
-            const deletedProtocolKey = deletedProtocolMessage.key as proto.IMessageKey & { oldid?: string };
+            const deletedProtocolKey = (deletedProtocolMessage.key || {}) as proto.IMessageKey & { oldid?: string };
             const deleteMessageKey = [
               this.instance.id,
               'delete',
