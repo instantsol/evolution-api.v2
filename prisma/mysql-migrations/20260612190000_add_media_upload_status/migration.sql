@@ -1,0 +1,4 @@
+ALTER TABLE `Media`
+ADD COLUMN `uploadStatus` VARCHAR(50) NULL DEFAULT 'uploaded',
+ADD COLUMN `uploadError` TEXT NULL,
+ADD COLUMN `uploadedAt` TIMESTAMP NULL;

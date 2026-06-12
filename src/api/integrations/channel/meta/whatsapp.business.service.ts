@@ -14,6 +14,7 @@ import {
   SendTextDto,
 } from '@api/dto/sendMessage.dto';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
+import { markMediaUploadFailed, markMediaUploadSuccess } from '@api/integrations/storage/s3/utils/media-upload-status';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { chatbotController } from '@api/server.module';
@@ -506,19 +507,23 @@ export class BusinessStartupService extends ChannelStartupService {
                 } else {
                   const fullName = join(`${this.instance.id}`, key.remoteJid, mediaType, fileName);
 
-                  await s3Service.uploadFile(fullName, buffer.data, size, {
-                    'Content-Type': mimetype,
-                  });
+                  const mediaUpload = {
+                    messageId: createdMessage.id,
+                    instanceId: this.instanceId,
+                    type: mediaType,
+                    fileName: fullName,
+                    mimetype,
+                  };
 
-                  await this.prismaRepository.media.create({
-                    data: {
-                      messageId: createdMessage.id,
-                      instanceId: this.instanceId,
-                      type: mediaType,
-                      fileName: fullName,
-                      mimetype,
-                    },
-                  });
+                  try {
+                    await s3Service.uploadFile(fullName, buffer.data, size, {
+                      'Content-Type': mimetype,
+                    });
+                    await markMediaUploadSuccess(this.prismaRepository, mediaUpload);
+                  } catch (uploadError) {
+                    await markMediaUploadFailed(this.prismaRepository, mediaUpload, uploadError);
+                    throw uploadError;
+                  }
 
                   const mediaUrl = await s3Service.getObjectUrl(fullName);
 

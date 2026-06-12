@@ -13,6 +13,10 @@ interface Metadata extends MinIo.ItemBucketMetadata {
   'Content-Type': string;
 }
 
+const objectPath = (folder: string, fileName: string) => join(folder, fileName);
+
+const getErrorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
 const minioClient = (() => {
   if (BUCKET?.ENABLE) {
     return new MinIo.Client({
@@ -80,21 +84,34 @@ createBucket();
 
 const uploadFile = async (fileName: string, file: Buffer | Transform | Readable, size: number, metadata: Metadata) => {
   if (minioClient) {
-    const objectName = join('evolution-api', fileName);
+    const objectName = objectPath('evolution-api', fileName);
     try {
       metadata['custom-header-application'] = 'evolution-api';
-      return await minioClient.putObject(bucketName, objectName, file, size, metadata);
+      const uploadResult = await minioClient.putObject(bucketName, objectName, file, size, metadata);
+      const objectStat = await minioClient.statObject(bucketName, objectName);
+      const expectedSize = Number(size);
+
+      if (Number.isFinite(expectedSize) && expectedSize > 0 && objectStat.size !== expectedSize) {
+        throw new Error(
+          `S3 upload verification failed for ${objectName}: expected ${expectedSize} bytes, got ${objectStat.size} bytes`,
+        );
+      }
+
+      logger.info(`S3 upload verified: ${bucketName}/${objectName} (${objectStat.size} bytes)`);
+      return { ...uploadResult, objectName, objectStat, verified: true };
     } catch (error) {
       logger.error(error);
-      return error;
+      throw new Error(`S3 upload failed for ${objectName}: ${getErrorMessage(error)}`);
     }
   }
+
+  throw new Error('S3 upload failed: client is not configured');
 };
 
 const getObjectUrl = async (fileName: string, expiry?: number) => {
   if (minioClient) {
     try {
-      const objectName = join('evolution-api', fileName);
+      const objectName = objectPath('evolution-api', fileName);
       if (expiry) {
         return await minioClient.presignedGetObject(bucketName, objectName, expiry);
       }
@@ -113,20 +130,33 @@ const uploadTempFile = async (
   metadata: Metadata,
 ) => {
   if (minioClient) {
-    const objectName = join(folder, fileName);
+    const objectName = objectPath(folder, fileName);
     try {
       metadata['custom-header-application'] = 'evolution-api';
-      return await minioClient.putObject(bucketName, objectName, file, size, metadata);
+      const uploadResult = await minioClient.putObject(bucketName, objectName, file, size, metadata);
+      const objectStat = await minioClient.statObject(bucketName, objectName);
+      const expectedSize = Number(size);
+
+      if (Number.isFinite(expectedSize) && expectedSize > 0 && objectStat.size !== expectedSize) {
+        throw new Error(
+          `S3 temp upload verification failed for ${objectName}: expected ${expectedSize} bytes, got ${objectStat.size} bytes`,
+        );
+      }
+
+      logger.info(`S3 temp upload verified: ${bucketName}/${objectName} (${objectStat.size} bytes)`);
+      return { ...uploadResult, objectName, objectStat, verified: true };
     } catch (error) {
       logger.error(error);
-      return error;
+      throw new Error(`S3 temp upload failed for ${objectName}: ${getErrorMessage(error)}`);
     }
   }
+
+  throw new Error('S3 temp upload failed: client is not configured');
 };
 
 const deleteFile = async (folder: string, fileName: string) => {
   if (minioClient) {
-    const objectName = join(folder, fileName);
+    const objectName = objectPath(folder, fileName);
     try {
       return await minioClient.removeObject(bucketName, objectName);
     } catch (error) {

@@ -54,6 +54,7 @@ import {
 } from '@api/dto/sendMessage.dto';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
+import { markMediaUploadFailed, markMediaUploadSuccess } from '@api/integrations/storage/s3/utils/media-upload-status';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { chatbotController, waMonitor } from '@api/server.module';
@@ -1804,17 +1805,23 @@ export class BaileysStartupService extends ChannelStartupService {
                         mediaType,
                         `${Date.now()}_${fileName}`,
                       );
-                      await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+                      const mediaUpload = {
+                        messageId: msg.id,
+                        instanceId: this.instanceId,
+                        type: mediaType,
+                        fileName: fullName,
+                        mimetype,
+                      };
 
-                      await this.prismaRepository.media.create({
-                        data: {
-                          messageId: msg.id,
-                          instanceId: this.instanceId,
-                          type: mediaType,
-                          fileName: fullName,
-                          mimetype,
-                        },
-                      });
+                      try {
+                        await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, {
+                          'Content-Type': mimetype,
+                        });
+                        await markMediaUploadSuccess(this.prismaRepository, mediaUpload);
+                      } catch (uploadError) {
+                        await markMediaUploadFailed(this.prismaRepository, mediaUpload, uploadError);
+                        throw uploadError;
+                      }
 
                       const mediaUrl = await s3Service.getObjectUrl(fullName);
 
@@ -3098,17 +3105,21 @@ export class BaileysStartupService extends ChannelStartupService {
                   fileName,
                 );
 
-                await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+                const mediaUpload = {
+                  messageId: msg.id,
+                  instanceId: this.instanceId,
+                  type: mediaType,
+                  fileName: fullName,
+                  mimetype,
+                };
 
-                await this.prismaRepository.media.create({
-                  data: {
-                    messageId: msg.id,
-                    instanceId: this.instanceId,
-                    type: mediaType,
-                    fileName: fullName,
-                    mimetype,
-                  },
-                });
+                try {
+                  await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+                  await markMediaUploadSuccess(this.prismaRepository, mediaUpload);
+                } catch (uploadError) {
+                  await markMediaUploadFailed(this.prismaRepository, mediaUpload, uploadError);
+                  throw uploadError;
+                }
 
                 const mediaUrl = await s3Service.getObjectUrl(fullName);
 

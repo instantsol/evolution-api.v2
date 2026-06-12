@@ -411,15 +411,18 @@ model TypebotSetting {
 }
 
 model Media {
-  id         String    @id @default(cuid())
-  fileName   String    @db.VarChar(500)
-  type       String    @db.VarChar(100)
-  mimetype   String    @db.VarChar(100)
-  createdAt  DateTime? @default(now()) @db.Date
-  Message    Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
-  messageId  String    @unique
-  Instance   Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
-  instanceId String
+  id           String    @id @default(cuid())
+  fileName     String    @db.VarChar(500)
+  type         String    @db.VarChar(100)
+  mimetype     String    @db.VarChar(100)
+  uploadStatus String?   @default("uploaded") @db.VarChar(50)
+  uploadError  String?   @db.Text
+  uploadedAt   DateTime? @db.Timestamp
+  createdAt    DateTime? @default(now()) @db.Date
+  Message      Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  messageId    String    @unique
+  Instance     Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId   String
 }
 
 model OpenaiCreds {

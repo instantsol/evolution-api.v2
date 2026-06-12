@@ -26,9 +26,10 @@ export const s3Schema: JSONSchema7 = {
   properties: {
     id: { type: 'string' },
     type: { type: 'string' },
+    uploadStatus: { type: 'string', enum: ['uploaded', 'failed'] },
     messageId: { type: 'integer' },
   },
-  ...isNotEmpty('id', 'type', 'messageId'),
+  ...isNotEmpty('id', 'type', 'uploadStatus', 'messageId'),
 };
 
 export const s3UrlSchema: JSONSchema7 = {
