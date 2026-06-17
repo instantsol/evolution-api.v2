@@ -1536,11 +1536,20 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        const remoteJids = contacts.map((c) => c.id);
+        const existingContacts = await this.prismaRepository.contact.findMany({
+          where: { remoteJid: { in: remoteJids }, instanceId: this.instanceId },
+          select: { remoteJid: true, kwik_contact_id: true, kwik_contact_name: true },
+        });
+        const existingByJid = Object.fromEntries(existingContacts.map((c) => [c.remoteJid, c]));
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
           pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
           profilePicUrl: null,
           instanceId: this.instanceId,
+          kwik_contact_id: existingByJid[contact.id]?.kwik_contact_id ?? null,
+          kwik_contact_name: existingByJid[contact.id]?.kwik_contact_name ?? null,
         }));
 
         if (contactsRaw.length > 0) {
@@ -2711,6 +2720,8 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: string;
             profilePicUrl?: string;
             instanceId: string;
+            kwik_contact_id?: string | null;
+            kwik_contact_name?: string | null;
           } = {
             id: received.key.remoteJid,
             remoteJid: received.key.remoteJid,
@@ -2720,6 +2731,8 @@ export class BaileysStartupService extends ChannelStartupService {
               '',
             profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
+            kwik_contact_id: contact?.kwik_contact_id ?? null,
+            kwik_contact_name: contact?.kwik_contact_name ?? null,
           };
 
           if (contactRaw.remoteJid === 'status@broadcast') {
