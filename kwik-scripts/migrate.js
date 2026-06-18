@@ -18,10 +18,10 @@ async function main() {
       FROM "Contact" c
       INNER JOIN "Instance" i on
       i.id = c."instanceId"
-      LEFT JOIN LATERAL (
+      JOIN LATERAL (
         SELECT *
         FROM "Message" m
-        WHERE (m.key->>'remoteJid') = c."remoteJid" and "instanceId" = c."instanceId"
+        WHERE m."instanceId" = c."instanceId" AND (m.key->>'remoteJid') = c."remoteJid"
         ORDER BY "messageTimestamp" DESC
         LIMIT 1
       ) m ON TRUE
@@ -29,6 +29,10 @@ async function main() {
   await prisma.$executeRawUnsafe(`
       CREATE INDEX IF NOT EXISTS idx_message_remotejid_createdat
       ON "Message" ((key->>'remoteJid'), "messageTimestamp" DESC);
+  `);
+  await prisma.$executeRawUnsafe(`
+      CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_message_instanceid_remotejid_timestamp
+      ON "Message" ("instanceId", (key->>'remoteJid'), "messageTimestamp" DESC);
   `);
   console.log('View contact_with_last_message criada com sucesso!');
 

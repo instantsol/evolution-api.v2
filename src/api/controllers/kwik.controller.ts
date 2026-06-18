@@ -778,10 +778,8 @@ export class KwikController {
     const owner = body?.where?.owner;
     const instances = await this.prismaRepository.instance.findMany({ where: { name: owner || instanceName } });
 
-    //const where: any = { instanceId: instance.id, lastmessagetimestamp: { not: null } };
     const where: any = {
       instanceId: { in: instances.map((instance) => instance.id) },
-      lastmessagetimestamp: { not: null },
     };
 
     if (body?.where?.id) where.remoteJid = body.where.id;
