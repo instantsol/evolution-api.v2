@@ -798,16 +798,22 @@ export class KwikController {
     const owner = body?.where?.owner;
     const instance = await this.prismaRepository.instance.findFirst({ where: { name: owner || instanceName } });
 
-    const payload: any = {
-      ...body,
-      where: {
-        ...body.where,
-        instanceId: instance.id,
-      },
-    };
+    const { where: bodyWhere, orderBy, skip, take } = body ?? {};
+    const { remotejid, messageid, ...restWhere } = bodyWhere ?? {};
+    // strip view-computed fields and owner which are not valid columns on the base Message model
+    delete (restWhere as any).owner;
+    delete (restWhere as any).text;
 
-    const data = await this.prismaRepository.messageWithRemoteJid.findMany({
-      ...payload,
+    const data = await this.prismaRepository.message.findMany({
+      where: {
+        ...restWhere,
+        instanceId: instance.id,
+        ...(remotejid ? { key: { path: ['remoteJid'], equals: remotejid } } : {}),
+        ...(messageid ? { key: { path: ['id'], equals: messageid } } : {}),
+      },
+      orderBy,
+      skip: skip ?? 0,
+      take: take ?? 100,
       select: {
         id: true,
         key: true,
@@ -818,48 +824,27 @@ export class KwikController {
         contextInfo: true,
         messageTimestamp: true,
         restricted: true,
-        remotejid: true,
         instanceId: true,
-        text: true,
-        messageid: true,
+        status: true,
+        MessageUpdate: {
+          select: {
+            keyId: true,
+            remoteJid: true,
+            fromMe: true,
+            participant: true,
+            status: true,
+          },
+        },
       },
     });
 
-    const messageIds = data.map((item: any) => item?.id).filter((id: string) => Boolean(id));
-    const messageStatusRows = messageIds.length
-      ? await this.prismaRepository.message.findMany({
-          where: {
-            id: { in: messageIds },
-          },
-          select: {
-            id: true,
-            status: true,
-            MessageUpdate: {
-              select: {
-                keyId: true,
-                remoteJid: true,
-                fromMe: true,
-                participant: true,
-                status: true,
-              },
-            },
-          },
-        })
-      : [];
-    const messageStatusById = new Map(messageStatusRows.map((row: any) => [row.id, row]));
-    const enrichedData = data.map((item: any) => {
-      const statusRow = messageStatusById.get(item?.id);
-
-      if (!statusRow) {
-        return item;
-      }
-
-      return {
-        ...item,
-        status: statusRow.status,
-        MessageUpdate: statusRow.MessageUpdate || [],
-      };
-    });
+    const enrichedData = data.map((item: any) => ({
+      ...item,
+      remotejid: item.key?.remoteJid ?? null,
+      messageid: item.key?.id ?? null,
+      text: item.message?.conversation ?? null,
+      MessageUpdate: item.MessageUpdate ?? [],
+    }));
 
     const pollMessages = enrichedData.filter((item: any) => item?.messageType === 'pollCreationMessageV3' && item?.id);
 
