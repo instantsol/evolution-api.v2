@@ -650,19 +650,38 @@ export class KwikController {
     kwik_contact_name: string,
   ) {
     const instance = await this.prismaRepository.instance.findFirst({ where: { name: instanceName } });
-    const contact = await this.prismaRepository.contact.findFirst({
-      where: { instanceId: instance.id, id: contact_id },
-    });
-    if (contact) {
-      const updated = await this.prismaRepository.contact.update({
-        where: { instanceId: instance.id, id: contact_id },
-        data: { kwik_contact_id: kwik_contact_id.toString(), kwik_contact_name },
-      });
+    if (!instance) {
+      return { status: 'error', message: 'instance not found' };
+    }
 
-      return { status: 'ok', updated: updated };
-    } else {
+    const contactWhere = {
+      instanceId: instance.id,
+      OR: [{ id: contact_id }, { remoteJid: contact_id }],
+    };
+
+    const contact = await this.prismaRepository.contact.findFirst({
+      where: contactWhere,
+    });
+
+    if (!contact) {
       return { status: 'error', message: 'contact not found' };
     }
+
+    const updateWhere = {
+      instanceId: instance.id,
+      id: contact.id,
+    };
+
+    const updateResult = await this.prismaRepository.contact.updateMany({
+      where: updateWhere,
+      data: { kwik_contact_id: kwik_contact_id.toString(), kwik_contact_name },
+    });
+
+    const updated = await this.prismaRepository.contact.findFirst({
+      where: updateWhere,
+    });
+
+    return { status: updateResult.count ? 'ok' : 'error', updated };
   }
 
   public async updateCRMInfo(kwik_contact_id: number, kwik_contact_name: string) {
