@@ -1,4 +1,5 @@
 import { InstanceDto } from '@api/dto/instance.dto';
+import { BUCKET, deleteFile } from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { channelController } from '@api/server.module';
@@ -188,6 +189,146 @@ export class WAMonitoringService {
     }
   }
 
+  private extractFileNameFromMediaUrl(mediaUrl?: string | null) {
+    if (!mediaUrl) {
+      return null;
+    }
+
+    try {
+      let normalizedPath = decodeURIComponent(new URL(mediaUrl).pathname || '').replace(/^\/+/, '');
+      const bucketName = BUCKET?.BUCKET_NAME;
+
+      if (bucketName && normalizedPath.startsWith(`${bucketName}/`)) {
+        normalizedPath = normalizedPath.substring(bucketName.length + 1);
+      }
+
+      if (normalizedPath.startsWith('evolution-api/')) {
+        normalizedPath = normalizedPath.substring('evolution-api/'.length);
+      }
+
+      return normalizedPath || null;
+    } catch {
+      this.logger.warn(`Failed to parse mediaUrl for cleanup: ${mediaUrl}`);
+      return null;
+    }
+  }
+
+  private async deleteStoredMediaFiles(fileNames: string[]) {
+    const uniqueFileNames = Array.from(new Set((fileNames || []).filter(Boolean)));
+    const deletedFileNames: string[] = [];
+    const failedFileNames: string[] = [];
+
+    if (!BUCKET?.ENABLE || uniqueFileNames.length === 0) {
+      return {
+        attemptedCount: uniqueFileNames.length,
+        deletedCount: 0,
+        failedCount: 0,
+        deletedFileNames,
+        failedFileNames,
+      };
+    }
+
+    for (const fileName of uniqueFileNames) {
+      try {
+        const result = await deleteFile('evolution-api', fileName);
+        const failed = result instanceof Error || (result && typeof (result as any).message === 'string');
+
+        if (failed) {
+          failedFileNames.push(fileName);
+        } else {
+          deletedFileNames.push(fileName);
+        }
+      } catch (error) {
+        this.logger.error(['Error deleting media file from bucket', fileName, error?.message, error?.stack]);
+        failedFileNames.push(fileName);
+      }
+    }
+
+    return {
+      attemptedCount: uniqueFileNames.length,
+      deletedCount: deletedFileNames.length,
+      failedCount: failedFileNames.length,
+      deletedFileNames,
+      failedFileNames,
+    };
+  }
+
+  private async cleanupStoredMediaFiles(instanceId: string, instanceName: string) {
+    const batchSize = 500;
+    let lastMessageId: string | null = null;
+    let scannedMessageCount = 0;
+    let foundMediaCount = 0;
+    let deletedMediaFileCount = 0;
+    let failedMediaFileCount = 0;
+    const failedMediaFiles = new Set<string>();
+    let hasMoreMessages = true;
+
+    while (hasMoreMessages) {
+      const messages = await this.prismaRepository.message.findMany({
+        where: {
+          instanceId,
+          ...(lastMessageId ? { id: { gt: lastMessageId } } : {}),
+        },
+        orderBy: { id: 'asc' },
+        take: batchSize,
+        select: {
+          id: true,
+          message: true,
+        },
+      });
+
+      if (!messages.length) {
+        hasMoreMessages = false;
+        continue;
+      }
+
+      scannedMessageCount += messages.length;
+      lastMessageId = messages[messages.length - 1].id;
+
+      const messageIds = messages.map((message) => message.id);
+      const medias = await this.prismaRepository.media.findMany({
+        where: {
+          instanceId,
+          messageId: { in: messageIds },
+        },
+        select: {
+          fileName: true,
+        },
+      });
+
+      foundMediaCount += medias.length;
+      const mediaFileNames = new Set<string>();
+
+      for (const media of medias) {
+        if (media.fileName) {
+          mediaFileNames.add(media.fileName);
+        }
+      }
+
+      for (const message of messages) {
+        const fallbackMediaFile = this.extractFileNameFromMediaUrl((message.message as any)?.mediaUrl);
+        if (fallbackMediaFile) {
+          mediaFileNames.add(fallbackMediaFile);
+        }
+      }
+
+      const mediaDeletionResult = await this.deleteStoredMediaFiles(Array.from(mediaFileNames));
+      deletedMediaFileCount += mediaDeletionResult.deletedCount;
+      failedMediaFileCount += mediaDeletionResult.failedCount;
+      mediaDeletionResult.failedFileNames.forEach((fileName) => failedMediaFiles.add(fileName));
+    }
+
+    this.logger.info(
+      `Instance "${instanceName}" media cleanup: scannedMessages=${scannedMessageCount}, medias=${foundMediaCount}, deletedFiles=${deletedMediaFileCount}, failedFiles=${failedMediaFileCount}`,
+    );
+
+    if (failedMediaFiles.size) {
+      this.logger.warn(
+        `Instance "${instanceName}" failed media cleanup files: ${Array.from(failedMediaFiles).slice(0, 50).join(', ')}`,
+      );
+    }
+  }
+
   public async cleaningStoreData(instanceName: string) {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
       const instancePath = join(STORE_DIR, 'chatwoot', instanceName);
@@ -207,6 +348,7 @@ export class WAMonitoringService {
     await this.prismaRepository.chat.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.contact.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.messageUpdate.deleteMany({ where: { instanceId: instance.id } });
+    await this.cleanupStoredMediaFiles(instance.id, instanceName);
     await this.prismaRepository.message.deleteMany({ where: { instanceId: instance.id } });
 
     await this.prismaRepository.webhook.deleteMany({ where: { instanceId: instance.id } });
@@ -396,8 +538,8 @@ export class WAMonitoringService {
 
         this.clearDelInstanceTime(instanceName);
 
-        this.cleaningUp(instanceName);
-        this.cleaningStoreData(instanceName);
+        await this.cleaningUp(instanceName);
+        await this.cleaningStoreData(instanceName);
       } finally {
         this.logger.warn(`Instance "${instanceName}" - REMOVED`);
       }
