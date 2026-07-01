@@ -326,7 +326,12 @@ export class InstanceController {
         return instance.qrCode;
       }
 
-      if (state == 'close') {
+      if (state == 'close' || state == 'refused') {
+        if (state == 'refused') {
+          (instance as any).connectionRefusedReason = undefined;
+          (instance as any).stateConnection = { state: 'close' };
+        }
+
         await instance.connectToWhatsapp(number);
 
         await delay(2000);
@@ -395,10 +400,14 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+
     return {
       instance: {
         instanceName: instanceName,
-        state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
+        state: instance?.connectionStatus?.state,
+        statusReason: instance?.connectionStatus?.statusReason,
+        reason: (instance as any)?.connectionRefusedReason,
       },
     };
   }
