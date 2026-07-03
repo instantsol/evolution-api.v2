@@ -166,6 +166,44 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
+const normalizePhone = (value?: string) =>
+  String(value || '')
+    .split('@')[0]
+    .split(':')[0]
+    .replace(/\D/g, '');
+
+const sameBrazilianMobileWithOptionalNinthDigit = (phone: string, phoneNumber: string) => {
+  if (!phone.startsWith('55') || !phoneNumber.startsWith('55')) {
+    return false;
+  }
+
+  if (phone.length === 13 && phoneNumber.length === 12) {
+    return phone.slice(0, 4) === phoneNumber.slice(0, 4) && phone[4] === '9' && phone.slice(5) === phoneNumber.slice(4);
+  }
+
+  if (phone.length === 12 && phoneNumber.length === 13) {
+    return (
+      phone.slice(0, 4) === phoneNumber.slice(0, 4) && phoneNumber[4] === '9' && phone.slice(4) === phoneNumber.slice(5)
+    );
+  }
+
+  return false;
+};
+
+const samePhone = (phone?: string, phoneNumber?: string) => {
+  const normalizedPhone = normalizePhone(phone);
+  const normalizedPhoneNumber = normalizePhone(phoneNumber);
+
+  if (!normalizedPhone || !normalizedPhoneNumber) {
+    return false;
+  }
+
+  return (
+    normalizedPhone === normalizedPhoneNumber ||
+    sameBrazilianMobileWithOptionalNinthDigit(normalizedPhone, normalizedPhoneNumber)
+  );
+};
+
 // Adicione a função getVideoDuration no início do arquivo
 async function getVideoDuration(input: Buffer | string | Readable): Promise<number> {
   const MediaInfoFactory = (await import('mediainfo.js')).default;
@@ -261,9 +299,84 @@ export class BaileysStartupService extends ChannelStartupService {
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
+  public connectionRefusedReason?: string;
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  private expectedConnectionPhone() {
+    return normalizePhone(this.phoneNumber || this.instance.number);
+  }
+
+  private connectedWhatsAppPhone() {
+    return normalizePhone(this.client?.user?.id || this.instance.wuid);
+  }
+
+  private async rejectWrongConnectedPhone(connectedPhone: string, expectedPhone: string) {
+    this.logger.error({
+      msg: 'Connected WhatsApp number does not match instance number',
+      instance: this.instance.name,
+      expectedPhone,
+      connectedPhone,
+    });
+
+    this.stateConnection = {
+      state: 'refused',
+      statusReason: DisconnectReason.loggedOut,
+    };
+    this.connectionRefusedReason = 'wrongNumber';
+    this.endSession = true;
+
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: {
+        ownerJid: null,
+        connectionStatus: 'close',
+        disconnectionAt: new Date(),
+        disconnectionReasonCode: DisconnectReason.loggedOut,
+        disconnectionObject: JSON.stringify({
+          reason: 'wrongNumber',
+          expectedPhone,
+          connectedPhone,
+        }),
+      },
+    });
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      instance: this.instance.name,
+      ...this.stateConnection,
+      reason: 'wrongNumber',
+      expectedNumber: expectedPhone,
+      connectedNumber: connectedPhone,
+    });
+
+    try {
+      await this.logoutInstance();
+    } catch (error) {
+      this.logger.error(error);
+      this.client?.ws?.close();
+      this.client?.end(new Error('Wrong WhatsApp number connected'));
+    }
+
+    this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+  }
+
+  private async connectedPhoneMatchesExpected() {
+    const expectedPhone = this.expectedConnectionPhone();
+
+    if (!expectedPhone) {
+      return true;
+    }
+
+    const connectedPhone = this.connectedWhatsAppPhone();
+
+    if (samePhone(connectedPhone, expectedPhone)) {
+      return true;
+    }
+
+    await this.rejectWrongConnectedPhone(connectedPhone, expectedPhone);
+    return false;
   }
 
   public async logoutInstance() {
@@ -520,6 +633,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'open') {
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+
+      if (!(await this.connectedPhoneMatchesExpected())) {
+        return;
+      }
+
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
         this.instance.profilePictureUrl = profilePic.profilePictureUrl;
@@ -3426,7 +3544,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              await this.connectionUpdate(events['connection.update']);
+              if (this.endSession) return;
             }
 
             if (events['creds.update']) {
