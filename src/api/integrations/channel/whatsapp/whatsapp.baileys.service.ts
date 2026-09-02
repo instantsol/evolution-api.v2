@@ -74,6 +74,7 @@ import {
   ProviderSession,
   QrCode,
   S3,
+  ScoutRetryStats,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
@@ -297,6 +298,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
   public stateConnection: wa.StateConnection = { state: 'close' };
+  private lastOpenAt: Date | null = null;
+  private retryStatsTimer?: NodeJS.Timeout;
 
   public phoneNumber: string;
   public connectionRefusedReason?: string;
@@ -381,6 +384,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     //this.messageProcessor.onDestroy();
+    this.stopRetryStatsTimer();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
@@ -444,6 +448,130 @@ export class BaileysStartupService extends ChannelStartupService {
       base64: this.instance.qrcode?.base64,
       count: this.instance.qrcode?.count,
     };
+  }
+
+  /**
+   * Defensive read of Baileys' MessageRetryManager statistics. `messageRetryManager` is only
+   * populated when the socket is created with `enableRecentMessageCache: true`; reports
+   * unavailable instead of throwing when it isn't.
+   */
+  private getRetryManagerStats() {
+    const manager = this.client?.messageRetryManager;
+    if (!manager) {
+      return { available: false as const };
+    }
+
+    // `statistics` is typed `private` in the vendored fork's .d.ts but is a plain runtime
+    // property (no real JS #private field, no public getter) — cast is required to read it.
+    const statistics = (
+      manager as unknown as {
+        statistics: {
+          totalRetries: number;
+          successfulRetries: number;
+          failedRetries: number;
+          sessionRecreations: number;
+          phoneRequests: number;
+        };
+      }
+    ).statistics;
+    const { totalRetries, successfulRetries, failedRetries, sessionRecreations, phoneRequests } = statistics;
+    return {
+      available: true as const,
+      totalRetries,
+      successfulRetries,
+      failedRetries,
+      sessionRecreations,
+      phoneRequests,
+    };
+  }
+
+  /**
+   * RF07: on decrypt-retry exhaustion (Kwik's `message-retry.failed` patch to the vendored
+   * instantsol/Baileys fork — see openspec/changes/evolution-scout-observability/design.md),
+   * attempt a single fetchMessageHistory reconciliation for the failing conversation and emit a
+   * Scout-facing event correlating the failure to it. No loop/backoff: exactly one attempt.
+   */
+  private async handleMessageRetryFailed({ key }: { key: WAMessageKey }) {
+    const remoteJid = key?.remoteJid;
+
+    if (!remoteJid) {
+      this.sendDataWebhook(Events.MESSAGE_RETRY_FAILED, {
+        instance: this.instance.name,
+        failedMessageId: key?.id ?? null,
+        remoteJid: null,
+        reconciliation: null,
+      }).catch((error) => this.logger.error({ msg: 'Failed to send message-retry.failed webhook', error }));
+      return;
+    }
+
+    let peerDataRequestSessionId: string | null = null;
+    try {
+      // Anchor: oldest known message for this conversation, same lookup shape as findMessages /
+      // the manual /kwik/fetchMessageHistory endpoint.
+      const oldestMessage = await this.prismaRepository.message.findFirst({
+        where: {
+          instanceId: this.instanceId,
+          key: { path: ['remoteJid'], equals: remoteJid },
+        },
+        orderBy: { messageTimestamp: 'asc' },
+        select: { key: true, messageTimestamp: true },
+      });
+
+      if (oldestMessage?.key) {
+        peerDataRequestSessionId = await this.client.fetchMessageHistory(
+          50,
+          oldestMessage.key as any,
+          oldestMessage.messageTimestamp,
+        );
+      } else {
+        this.logger.warn({ msg: 'No known messages for conversation; cannot reconcile', remoteJid });
+      }
+    } catch (error) {
+      this.logger.error({ msg: 'Automatic reconciliation fetchMessageHistory failed', error, remoteJid });
+    }
+
+    this.sendDataWebhook(Events.MESSAGE_RETRY_FAILED, {
+      instance: this.instance.name,
+      failedMessageId: key?.id ?? null,
+      remoteJid,
+      reconciliation: peerDataRequestSessionId ? { peerDataRequestSessionId } : null,
+    }).catch((error) => this.logger.error({ msg: 'Failed to send message-retry.failed webhook', error }));
+  }
+
+  /**
+   * Periodic live snapshot of the retry-manager stats, independent of connection.update events.
+   * Reuses CONNECTION_UPDATE with a `snapshotType: 'periodic'` discriminator rather than a new
+   * event type — this is Kwik's internal fork, not upstreamed, so there's no unknown external
+   * consumer contract to protect (see openspec/changes/evolution-scout-observability/design.md).
+   * Started once per service instance lifetime (idempotent) and survives reconnects, since it
+   * only depends on `this.client`/`this.stateConnection` being current at each tick.
+   */
+  private startRetryStatsTimer() {
+    if (this.retryStatsTimer) {
+      return;
+    }
+
+    const intervalSeconds = this.configService.get<ScoutRetryStats>('SCOUT_RETRY_STATS').INTERVAL;
+    this.retryStatsTimer = setInterval(() => {
+      if (this.endSession || this.stateConnection.state !== 'open') {
+        return;
+      }
+
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: this.instance.name,
+        snapshotType: 'periodic',
+        ...this.stateConnection,
+        lastOpenAt: this.lastOpenAt,
+        retryStats: this.getRetryManagerStats(),
+      }).catch((error) => this.logger.error({ msg: 'Failed to send periodic retry-stats webhook', error }));
+    }, intervalSeconds * 1000);
+  }
+
+  private stopRetryStatsTimer() {
+    if (this.retryStatsTimer) {
+      clearInterval(this.retryStatsTimer);
+      this.retryStatsTimer = undefined;
+    }
   }
 
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
@@ -567,6 +695,8 @@ export class BaileysStartupService extends ChannelStartupService {
         errorMessage: lastDisconnect?.error?.message ?? null,
         errorPayload: boomError?.output?.payload ?? null,
         disconnectDate: lastDisconnect?.date ?? null,
+        lastOpenAt: this.lastOpenAt,
+        retryStats: this.getRetryManagerStats(),
       };
 
       if (shouldReconnect) {
@@ -626,6 +756,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+        this.stopRetryStatsTimer();
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
       }
@@ -637,6 +768,8 @@ export class BaileysStartupService extends ChannelStartupService {
       if (!(await this.connectedPhoneMatchesExpected())) {
         return;
       }
+
+      this.lastOpenAt = new Date();
 
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -1491,6 +1624,7 @@ export class BaileysStartupService extends ChannelStartupService {
         keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
+      enableRecentMessageCache: true,
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as proto.IMessage | undefined,
       ...browserOptions,
@@ -1548,6 +1682,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     this.eventHandler();
+    this.startRetryStatsTimer();
 
     this.client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
@@ -1793,6 +1928,7 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest,
       progress,
       syncType,
+      peerDataRequestSessionId,
     }: {
       chats: Chat[];
       contacts: Contact[];
@@ -1800,6 +1936,7 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest?: boolean;
       progress?: number;
       syncType?: proto.HistorySync.HistorySyncType;
+      peerDataRequestSessionId?: string;
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
@@ -1808,6 +1945,15 @@ export class BaileysStartupService extends ChannelStartupService {
         console.log(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
+
+        this.sendDataWebhook(Events.MESSAGING_HISTORY_SET, {
+          instance: this.instance.name,
+          syncType,
+          peerDataRequestSessionId: peerDataRequestSessionId ?? null,
+          messageCount: messages.length,
+          isLatest: isLatest ?? null,
+          progress: progress ?? null,
+        }).catch((error) => this.logger.error({ msg: 'Failed to send messaging-history.set webhook', error }));
 
         const instance: InstanceDto = { instanceName: this.instance.name };
         const instanceObject = await this.prismaRepository.instance.findFirst({ where: { name: this.instance.name } });
@@ -3555,6 +3701,10 @@ export class BaileysStartupService extends ChannelStartupService {
             if (events['messaging-history.set']) {
               const payload = events['messaging-history.set'];
               await this.messageHandle['messaging-history.set'](payload);
+            }
+
+            if (events['message-retry.failed']) {
+              await this.handleMessageRetryFailed(events['message-retry.failed']);
             }
 
             if (events['messages.upsert']) {

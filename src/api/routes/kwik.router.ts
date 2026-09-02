@@ -285,6 +285,22 @@ export class KwikRouter extends RouterBroker {
 
       return res.status(HttpStatus.OK).json(response);
     });
+
+    this.router.post(this.routerPath('fetchMessageHistory'), ...guards, async (req, res) => {
+      const response = await this.dataValidate<InstanceDto>({
+        request: req,
+        schema: null,
+        ClassRef: InstanceDto,
+        execute: (instance) =>
+          kwikController.fetchMessageHistory(instance, { remoteJid: req.body?.remoteJid, count: req.body?.count }),
+      });
+
+      if (response?.status === 'error') {
+        return res.status(HttpStatus.BAD_REQUEST).json(response);
+      }
+
+      return res.status(HttpStatus.OK).json(response);
+    });
   }
   public readonly router: Router = Router();
 }

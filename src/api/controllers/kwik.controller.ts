@@ -3,6 +3,7 @@ import { BUCKET, deleteFile } from '@api/integrations/storage/s3/libs/minio.serv
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { SettingsService } from '@api/services/settings.service';
+import { Integration } from '@api/types/wa.types';
 import { Logger } from '@config/logger.config';
 import { calculateObjectSize } from 'bson';
 
@@ -910,5 +911,66 @@ export class KwikController {
         pollUpdates,
       };
     });
+  }
+
+  /**
+   * Triggers a per-conversation history recovery via Baileys' fetchMessageHistory. Does not
+   * return the recovered messages — they arrive asynchronously via `messaging-history.set`,
+   * correlated by the returned peerDataRequestSessionId.
+   */
+  public async fetchMessageHistory({ instanceName }: InstanceDto, body: { remoteJid?: string; count?: number }) {
+    const remoteJid = body?.remoteJid;
+    const count = Number(body?.count) || 50;
+
+    if (!remoteJid) {
+      return { status: 'error', message: 'remoteJid is required' };
+    }
+
+    const waInstance = this.waMonitor.waInstances[instanceName];
+
+    if (!waInstance) {
+      return { status: 'error', message: 'Instance not found' };
+    }
+
+    if (waInstance.integration !== Integration.WHATSAPP_BAILEYS) {
+      return { status: 'error', message: 'fetchMessageHistory is only supported for the Baileys integration' };
+    }
+
+    if (waInstance.connectionStatus?.state !== 'open') {
+      return { status: 'error', message: 'Instance is not connected' };
+    }
+
+    const instance = await this.prismaRepository.instance.findFirst({ where: { name: instanceName } });
+
+    if (!instance) {
+      return { status: 'error', message: 'Instance not found' };
+    }
+
+    // Anchor: oldest known message for this conversation, same lookup shape as findMessages
+    const oldestMessage = await this.prismaRepository.message.findFirst({
+      where: {
+        instanceId: instance.id,
+        key: { path: ['remoteJid'], equals: remoteJid },
+      },
+      orderBy: { messageTimestamp: 'asc' },
+      select: { key: true, messageTimestamp: true },
+    });
+
+    if (!oldestMessage?.key) {
+      return { status: 'error', message: 'No known messages for this conversation; cannot resolve a recovery anchor' };
+    }
+
+    try {
+      const peerDataRequestSessionId = await waInstance.client.fetchMessageHistory(
+        count,
+        oldestMessage.key as any,
+        oldestMessage.messageTimestamp,
+      );
+
+      return { status: 'success', peerDataRequestSessionId };
+    } catch (error) {
+      logger.error({ msg: 'fetchMessageHistory failed', error, instanceName, remoteJid });
+      return { status: 'error', message: error?.toString() };
+    }
   }
 }
