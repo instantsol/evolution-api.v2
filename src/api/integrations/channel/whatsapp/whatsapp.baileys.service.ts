@@ -1958,10 +1958,17 @@ export class BaileysStartupService extends ChannelStartupService {
         const instance: InstanceDto = { instanceName: this.instance.name };
         const instanceObject = await this.prismaRepository.instance.findFirst({ where: { name: this.instance.name } });
         const settings = await this.prismaRepository.setting.findFirst({ where: { instanceId: instanceObject.id } });
+        // ON_DEMAND syncs are explicit, bounded recovery requests (anchor + count), not automatic
+        // reconnect-triggered backfill-avoidance syncs — the disconnectionAt/initialConnection floor
+        // exists to avoid reimporting on every reconnect, which doesn't apply here. Without this
+        // exemption, ON_DEMAND recovery can never actually persist anything: it is by definition
+        // requesting messages older than what's already known, which is always older than the most
+        // recent disconnect.
         const timestampLimit = instanceObject.disconnectionAt
           ? instanceObject.disconnectionAt
           : settings.initialConnection;
-        let timestampLimitToImport = Math.floor(timestampLimit.getTime() / 1000);
+        let timestampLimitToImport =
+          syncType === proto.HistorySync.HistorySyncType.ON_DEMAND ? 0 : Math.floor(timestampLimit.getTime() / 1000);
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
           const daysLimitToImport = this.localChatwoot?.enabled ? this.localChatwoot.daysLimitImportMessages : 1000;
