@@ -867,49 +867,179 @@ export class KwikController {
     }));
 
     const pollMessages = enrichedData.filter((item: any) => item?.messageType === 'pollCreationMessageV3' && item?.id);
+    const eventMessages = enrichedData.filter((item: any) => item?.messageType === 'eventMessage' && item?.id);
 
-    if (!pollMessages.length) {
+    if (!pollMessages.length && !eventMessages.length) {
       return enrichedData;
     }
 
-    const pollMessageIds = pollMessages.map((item: any) => item.id);
-    const pollUpdateRows = await this.prismaRepository.messageUpdate.findMany({
-      where: {
-        messageId: {
-          in: pollMessageIds,
-        },
-      },
-      orderBy: {
-        id: 'desc',
-      },
-      select: {
-        messageId: true,
-        pollUpdates: true,
-      },
-    });
-
     const latestPollUpdates = new Map();
+    const latestEventResponses = new Map();
 
-    for (const row of pollUpdateRows as any[]) {
-      if (latestPollUpdates.has(row.messageId)) {
-        continue;
+    if (pollMessages.length) {
+      const pollMessageIds = pollMessages.map((item: any) => item.id);
+      const pollMessageKeyIds = pollMessages.map((item: any) => item?.key?.id).filter(Boolean);
+      const pollUpdateRows = await this.prismaRepository.messageUpdate.findMany({
+        where: {
+          OR: [
+            {
+              messageId: {
+                in: pollMessageIds,
+              },
+            },
+            {
+              keyId: {
+                in: pollMessageKeyIds,
+              },
+            },
+          ],
+        },
+        orderBy: {
+          id: 'desc',
+        },
+        select: {
+          messageId: true,
+          keyId: true,
+          pollUpdates: true,
+        },
+      });
+
+      for (const row of pollUpdateRows as any[]) {
+        if (Array.isArray(row.pollUpdates) && row.pollUpdates.length) {
+          if (row.messageId && !latestPollUpdates.has(row.messageId)) {
+            latestPollUpdates.set(row.messageId, row.pollUpdates);
+          }
+
+          if (row.keyId && !latestPollUpdates.has(row.keyId)) {
+            latestPollUpdates.set(row.keyId, row.pollUpdates);
+          }
+        }
       }
+    }
 
-      if (Array.isArray(row.pollUpdates) && row.pollUpdates.length) {
-        latestPollUpdates.set(row.messageId, row.pollUpdates);
+    if (eventMessages.length) {
+      const normalizeEventResponses = (responses: any[] = []) => {
+        if (!Array.isArray(responses)) {
+          return [];
+        }
+
+        return responses
+          .map((response, index) => {
+            if (!response || typeof response !== 'object') {
+              return null;
+            }
+
+            const nestedResponse = response.response && typeof response.response === 'object' ? response.response : {};
+            const responseKey = response.eventResponseMessageKey || {};
+            const identifier = String(
+              response.id ||
+                response.jid ||
+                response.responderJid ||
+                response.remoteJid ||
+                responseKey.participant ||
+                responseKey.remoteJid ||
+                `response-${index}`,
+            ).trim();
+
+            return {
+              id: identifier,
+              name: response.name || response.pushName || response.displayName || '',
+              response: nestedResponse.response ?? response.response,
+              timestampMs: response.timestampMs ?? response.senderTimestampMs ?? nestedResponse.timestampMs,
+              extraGuestCount: response.extraGuestCount ?? nestedResponse.extraGuestCount,
+            };
+          })
+          .filter(Boolean);
+      };
+      const mergeEventResponses = (currentResponses: any[] = [], incomingResponses: any[] = []) => {
+        const responseMap = new Map();
+        const appendResponses = (responses: any[] = []) => {
+          if (!Array.isArray(responses)) {
+            return;
+          }
+
+          responses.forEach((response, index) => {
+            const identifier = String(
+              response?.id || response?.jid || response?.responderJid || response?.remoteJid || `response-${index}`,
+            ).trim();
+            responseMap.set(identifier, {
+              ...(responseMap.get(identifier) || {}),
+              ...response,
+            });
+          });
+        };
+
+        appendResponses(currentResponses);
+        appendResponses(incomingResponses);
+
+        return Array.from(responseMap.values());
+      };
+      const eventMessageIds = eventMessages.map((item: any) => item.id);
+      const eventMessageKeyIds = eventMessages.map((item: any) => item?.key?.id).filter(Boolean);
+      const eventResponseRows = await this.prismaRepository.messageUpdate.findMany({
+        where: {
+          OR: [
+            {
+              messageId: {
+                in: eventMessageIds,
+              },
+            },
+            {
+              keyId: {
+                in: eventMessageKeyIds,
+              },
+            },
+          ],
+          status: 'EVENT_RESPONSE',
+        },
+        orderBy: {
+          id: 'desc',
+        },
+        select: {
+          messageId: true,
+          keyId: true,
+          pollUpdates: true,
+        },
+      });
+
+      for (const row of eventResponseRows as any[]) {
+        if (Array.isArray(row.pollUpdates) && row.pollUpdates.length) {
+          const pollUpdates = normalizeEventResponses(row.pollUpdates);
+          if (row.messageId) {
+            latestEventResponses.set(
+              row.messageId,
+              mergeEventResponses(pollUpdates, latestEventResponses.get(row.messageId) || []),
+            );
+          }
+
+          if (row.keyId) {
+            latestEventResponses.set(
+              row.keyId,
+              mergeEventResponses(pollUpdates, latestEventResponses.get(row.keyId) || []),
+            );
+          }
+        }
       }
     }
 
     return enrichedData.map((item: any) => {
-      if (item?.messageType !== 'pollCreationMessageV3') {
-        return item;
+      if (item?.messageType === 'pollCreationMessageV3') {
+        const pollUpdates = latestPollUpdates.get(item.id) || latestPollUpdates.get(item?.key?.id) || [];
+        return {
+          ...item,
+          pollUpdates,
+        };
       }
 
-      const pollUpdates = latestPollUpdates.get(item.id) || [];
-      return {
-        ...item,
-        pollUpdates,
-      };
+      if (item?.messageType === 'eventMessage') {
+        const eventResponses = latestEventResponses.get(item.id) || latestEventResponses.get(item?.key?.id) || [];
+        return {
+          ...item,
+          eventResponses,
+        };
+      }
+
+      return item;
     });
   }
 

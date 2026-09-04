@@ -100,6 +100,7 @@ import makeWASocket, {
   Chat,
   ConnectionState,
   Contact,
+  decryptEventResponse,
   decryptPollVote,
   decryptSecretEncryptedMessage,
   delay,
@@ -2402,6 +2403,250 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          if (messageRaw.messageType === 'encEventResponseMessage') {
+            // Baileys' own native decrypt for encEventResponseMessage (Utils/process-message.ts)
+            // only has access to the response's embedded key fields via its generic getMessage(key)
+            // callback, which returns message content only (no key). That single JID guess reliably
+            // fails GCM authentication for lid-addressed accounts, so we decrypt it here instead,
+            // where we can fetch the full stored event message (including its own key) and try every
+            // plausible creator/responder JID combination — the same approach poll vote decryption
+            // needs for the same reason. Whatever the outcome, the raw envelope never becomes a
+            // Message row or a MESSAGES_UPSERT push: only a MESSAGES_UPDATE, matching how poll votes
+            // are meant to arrive as updates rather than new messages.
+            const encEventResponse = messageRaw.message?.encEventResponseMessage;
+            const eventCreationKey = encEventResponse?.eventCreationMessageKey;
+            const eventMessage = eventCreationKey ? ((await this.getMessage(eventCreationKey, true)) as any) : null;
+            const eventMessageSecret = eventCreationKey ? ((await this.getMessage(eventCreationKey)) as any) : null;
+
+            const eventEncKey =
+              this.normalizeMessageSecret(eventMessageSecret?.messageContextInfo?.messageSecret) ||
+              this.normalizeMessageSecret(eventMessage?.message?.messageContextInfo?.messageSecret);
+
+            const normalizedEventResponse = {
+              ...(encEventResponse || {}),
+              encPayload: this.normalizeMessageSecret(encEventResponse?.encPayload),
+              encIv: this.normalizeMessageSecret(encEventResponse?.encIv),
+            };
+
+            let decryptedEventResponse: proto.Message.IEventResponseMessage | undefined;
+            let successfulResponderJid = String(
+              (received.key.fromMe ? this.instance.wuid : received.key.participant || received.key.remoteJid) || '',
+            ).trim();
+
+            if (
+              eventCreationKey?.id &&
+              normalizedEventResponse.encPayload &&
+              normalizedEventResponse.encIv &&
+              eventEncKey
+            ) {
+              const normalizeJidCandidate = (id: any) => {
+                const rawId = String(id || '').trim();
+                if (!rawId) {
+                  return '';
+                }
+                try {
+                  return jidNormalizedUser(rawId);
+                } catch {
+                  return rawId;
+                }
+              };
+              const lidToPhoneJidCache = new Map<string, string>();
+              const resolvePhoneJidFromLid = async (id: any) => {
+                const normalizedId = normalizeJidCandidate(id);
+                if (!normalizedId || !normalizedId.includes('@lid')) {
+                  return '';
+                }
+                if (lidToPhoneJidCache.has(normalizedId)) {
+                  return lidToPhoneJidCache.get(normalizedId) || '';
+                }
+                try {
+                  const resolved = normalizeJidCandidate(
+                    await this.client.signalRepository.lidMapping.getPNForLID(normalizedId),
+                  );
+                  lidToPhoneJidCache.set(normalizedId, resolved);
+                  return resolved;
+                } catch {
+                  lidToPhoneJidCache.set(normalizedId, '');
+                  return '';
+                }
+              };
+              const expandJidCandidates = async (candidates: any[]) => {
+                const expandedCandidates: string[] = [];
+                for (const candidate of candidates) {
+                  const normalizedCandidate = normalizeJidCandidate(candidate);
+                  if (!normalizedCandidate) {
+                    continue;
+                  }
+                  expandedCandidates.push(normalizedCandidate);
+                  const phoneJid = await resolvePhoneJidFromLid(normalizedCandidate);
+                  if (phoneJid) {
+                    expandedCandidates.push(phoneJid);
+                  }
+                }
+                return [...new Set(expandedCandidates)];
+              };
+
+              const eventCreationKeyAny = eventCreationKey as any;
+              const eventMessageKeyAny = eventMessage?.key as any;
+              const originalKeyAny = originalMessageKey as any;
+              const key = received.key as any;
+
+              const creatorCandidates = await expandJidCandidates([
+                eventCreationKeyAny.participant,
+                eventCreationKeyAny.participantAlt,
+                eventCreationKeyAny.remoteJid,
+                eventCreationKeyAny.remoteJidAlt,
+                eventMessageKeyAny?.participant,
+                eventMessageKeyAny?.participantAlt,
+                eventMessageKeyAny?.remoteJid,
+                eventMessageKeyAny?.remoteJidAlt,
+                this.instance.wuid,
+                this.client.user?.id,
+                this.client.user?.lid,
+              ]);
+
+              const responderCandidates = await expandJidCandidates([
+                key.participant,
+                key.participantAlt,
+                key.remoteJid,
+                key.remoteJidAlt,
+                originalKeyAny.participant,
+                originalKeyAny.participantAlt,
+                originalKeyAny.remoteJid,
+                originalKeyAny.remoteJidAlt,
+                this.instance.wuid,
+                this.client.user?.id,
+                this.client.user?.lid,
+              ]);
+
+              findMatch: for (const creator of creatorCandidates) {
+                for (const responder of responderCandidates) {
+                  try {
+                    decryptedEventResponse = decryptEventResponse(normalizedEventResponse, {
+                      eventCreatorJid: creator,
+                      eventMsgId: eventCreationKey.id,
+                      eventEncKey,
+                      responderJid: responder,
+                    } as any);
+                    if (decryptedEventResponse) {
+                      successfulResponderJid = String(responder || '').trim();
+                      break findMatch;
+                    }
+                  } catch {
+                    // try the next creator/responder jid combination
+                  }
+                }
+              }
+            }
+
+            if (eventMessage?.id) {
+              // Some accounts fail to decrypt the event-response payload itself (tracked separately
+              // — likely a Baileys-side gap for lid-addressed 1:1 chats, not something fixable here).
+              // Until that's resolved for those accounts we can't know which option was picked, but
+              // we still know someone responded, so record that much: who, and when.
+              const toPlainNumber = (value: any) => (Long.isLong(value) ? value.toNumber() : value);
+              const responderId =
+                successfulResponderJid || String(received.key.participant || received.key.remoteJid || '').trim();
+              const responderName = String((received.key.fromMe ? this.instance.name : received.pushName) || '').trim();
+              const currentEventResponse = decryptedEventResponse
+                ? {
+                    id: responderId,
+                    name: responderName || undefined,
+                    response: decryptedEventResponse.response,
+                    timestampMs: toPlainNumber(decryptedEventResponse.timestampMs),
+                    extraGuestCount: decryptedEventResponse.extraGuestCount,
+                  }
+                : {
+                    id: responderId,
+                    name: responderName || undefined,
+                    response: null,
+                    timestampMs: toPlainNumber(received.messageTimestamp),
+                  };
+
+              if (!decryptedEventResponse) {
+                this.logger.warn(
+                  `Unable to decrypt event response content for event ${eventCreationKey?.id}, recording responder only. Response key: ${JSON.stringify(
+                    received.key,
+                  )}`,
+                );
+              }
+
+              let consolidatedEventResponses: any[] = [currentEventResponse];
+
+              try {
+                const previousEventResponseRecords = await this.prismaRepository.messageUpdate.findMany({
+                  where: {
+                    instanceId: this.instanceId,
+                    keyId: eventCreationKey.id,
+                    status: 'EVENT_RESPONSE',
+                  },
+                  select: { pollUpdates: true },
+                  orderBy: { id: 'asc' },
+                });
+
+                const responseMap = new Map<string, any>();
+                const appendResponses = (responses: any) => {
+                  if (!Array.isArray(responses)) {
+                    return;
+                  }
+                  responses.forEach((response: any) => {
+                    const id = String(response?.id || '').trim();
+                    if (!id) {
+                      return;
+                    }
+                    responseMap.set(id, { ...responseMap.get(id), ...response });
+                  });
+                };
+
+                previousEventResponseRecords.forEach((record) => appendResponses(record.pollUpdates));
+                appendResponses([currentEventResponse]);
+                consolidatedEventResponses = Array.from(responseMap.values());
+              } catch (error) {
+                this.logger.warn([
+                  `Unable to consolidate event responses for event ${eventCreationKey.id}`,
+                  error?.message,
+                  error?.stack,
+                ]);
+              }
+
+              const eventRemoteJid =
+                eventCreationKey?.remoteJidAlt || eventCreationKey?.remoteJid || received.key.remoteJid;
+
+              await this.prismaRepository.messageUpdate.create({
+                data: {
+                  fromMe: eventCreationKey?.fromMe ?? received.key.fromMe,
+                  keyId: eventCreationKey?.id ?? received.key.id,
+                  remoteJid: eventRemoteJid,
+                  participant: currentEventResponse.id,
+                  status: 'EVENT_RESPONSE',
+                  pollUpdates: consolidatedEventResponses,
+                  instanceId: this.instanceId,
+                  messageId: eventMessage.id,
+                },
+              });
+
+              this.sendDataWebhook(Events.MESSAGES_UPDATE, {
+                keyId: eventCreationKey?.id ?? received.key.id,
+                remoteJid: eventRemoteJid,
+                fromMe: eventCreationKey?.fromMe ?? received.key.fromMe,
+                participant: currentEventResponse.id,
+                status: 'EVENT_RESPONSE',
+                pollUpdates: consolidatedEventResponses,
+                eventResponses: consolidatedEventResponses,
+                eventCreationMessageKey: eventCreationKey,
+                instanceId: this.instanceId,
+              });
+            } else {
+              this.logger.warn(
+                `Event creation message not found for response. Event key: ${JSON.stringify(
+                  eventCreationKey,
+                )}. Response key: ${JSON.stringify(received.key)}`,
+              );
+            }
+
+            continue;
+          }
+
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;
             const pollMessage = (await this.getMessage(pollCreationKey, true)) as proto.IWebMessageInfo;
@@ -3105,6 +3350,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (key.remoteJid !== 'status@broadcast' && key.id !== undefined) {
           let pollUpdates: any;
+          let eventResponses: any;
 
           if (update.pollUpdates) {
             const pollCreation = await this.getMessage(key);
@@ -3117,14 +3363,90 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          let eventResponseParticipant: string | undefined;
+
+          if (Array.isArray((update as any).eventResponses)) {
+            const incomingEventResponses = ((update as any).eventResponses as any[])
+              .map((eventResponse) => {
+                const response = eventResponse?.response || {};
+                const responseKey = eventResponse?.eventResponseMessageKey || {};
+                const id = String(responseKey.participant || responseKey.remoteJid || '').trim();
+
+                if (!id) {
+                  return null;
+                }
+
+                return {
+                  id,
+                  response: response.response,
+                  timestampMs: eventResponse?.senderTimestampMs || response.timestampMs,
+                  extraGuestCount: response.extraGuestCount,
+                };
+              })
+              .filter(Boolean);
+
+            eventResponses = incomingEventResponses;
+            eventResponseParticipant = incomingEventResponses[0]?.id;
+
+            if (incomingEventResponses.length) {
+              try {
+                const previousEventResponseRecords = await this.prismaRepository.messageUpdate.findMany({
+                  where: {
+                    instanceId: this.instanceId,
+                    keyId: key.id,
+                    status: 'EVENT_RESPONSE',
+                  },
+                  select: {
+                    pollUpdates: true,
+                  },
+                  orderBy: {
+                    id: 'asc',
+                  },
+                });
+
+                const responseMap = new Map<string, any>();
+                const appendResponses = (responses: any) => {
+                  if (!Array.isArray(responses)) {
+                    return;
+                  }
+
+                  responses.forEach((response: any) => {
+                    const id = String(response?.id || '').trim();
+                    if (!id) {
+                      return;
+                    }
+
+                    responseMap.set(id, { ...responseMap.get(id), ...response });
+                  });
+                };
+
+                previousEventResponseRecords.forEach((record) => appendResponses(record.pollUpdates));
+                appendResponses(incomingEventResponses);
+
+                eventResponses = Array.from(responseMap.values());
+              } catch (error) {
+                this.logger.warn([
+                  `Unable to consolidate event responses for event ${key.id}`,
+                  error?.message,
+                  error?.stack,
+                ]);
+              }
+            }
+          }
+
           const message: any = {
             keyId: key.id,
-            remoteJid: key?.remoteJid,
+            remoteJid: eventResponses ? (key as any)?.remoteJidAlt || key?.remoteJid : key?.remoteJid,
             fromMe: key.fromMe,
-            participant: key?.participant,
-            status: status[update.status] ?? 'SERVER_ACK',
-            pollUpdates,
+            participant: eventResponseParticipant || key?.participant,
+            status: eventResponses
+              ? 'EVENT_RESPONSE'
+              : pollUpdates
+                ? 'POLL_UPDATE'
+                : (status[update.status] ?? 'SERVER_ACK'),
+            pollUpdates: eventResponses || pollUpdates,
             instanceId: this.instanceId,
+            ...(eventResponses ? { eventResponses, eventCreationMessageKey: key } : {}),
           };
 
           if (update.message) {
@@ -3299,8 +3621,14 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { message: _msg, ...messageData } = message;
+            /* eslint-disable @typescript-eslint/no-unused-vars */
+            const {
+              message: _msg,
+              eventResponses: _eventResponses,
+              eventCreationMessageKey: _eventCreationMessageKey,
+              ...messageData
+            } = message;
+            /* eslint-enable @typescript-eslint/no-unused-vars */
             await this.prismaRepository.messageUpdate.create({ data: messageData });
           }
 
