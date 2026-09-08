@@ -1,0 +1,55 @@
+# message-recovery
+
+## Purpose
+
+TBD — created by the `evolution-scout-observability` change. Governs how the system recovers missed or undecryptable WhatsApp message history for a conversation, both on manual request and automatically when decrypt retries are exhausted, using Baileys' `fetchMessageHistory` and propagating the resulting `messaging-history.set` sync events to Scout.
+
+## Requirements
+
+### Requirement: Manual per-conversation history recovery endpoint
+The system SHALL expose an endpoint under the `/kwik/` route that triggers `sock.fetchMessageHistory` for a single conversation, given an instance identifier, `remoteJid`, a message count, and an anchor (oldest known message key + timestamp for that conversation, resolved the same way as the existing `findMessages` flow). The endpoint SHALL return the resulting `peerDataRequestSessionId` and SHALL NOT return the recovered messages directly.
+
+#### Scenario: Successful trigger returns peerDataRequestSessionId
+- **WHEN** a valid, authenticated instance and a resolvable anchor for the given `remoteJid` are provided
+- **THEN** the system calls `sock.fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)` and returns the `peerDataRequestSessionId` along with confirmation that the request was dispatched
+
+#### Scenario: Invalid instance or anchor returns an error
+- **WHEN** the instance is not authenticated, or no anchor can be resolved for the given `remoteJid`
+- **THEN** the endpoint returns an appropriate error status and message instead of attempting the call
+
+### Requirement: Propagate history-sync results
+The system SHALL propagate Baileys' `messaging-history.set` event to the Scout webhook layer, including `syncType`, `peerDataRequestSessionId`, the number of messages in the batch, `isLatest`, and `progress`, and SHALL make this event selectable in the per-instance webhook subscription configuration.
+
+#### Scenario: History-sync event propagated
+- **WHEN** Baileys emits `messaging-history.set`
+- **THEN** the system forwards a `MESSAGING_HISTORY_SET` webhook with `syncType`, `peerDataRequestSessionId`, message count, `isLatest`, and `progress`
+
+#### Scenario: Event is subscribable
+- **WHEN** an instance configures its `webhookEvents` list
+- **THEN** `MESSAGING_HISTORY_SET` is a valid, selectable value
+
+### Requirement: Automatic single-shot reconciliation on failed retries
+When a message's decrypt retries are exhausted (`failedRetries` increments), the system SHALL attempt to capture the failing conversation's `remoteJid` and, if available, SHALL trigger exactly one `fetchMessageHistory` reconciliation for that conversation, emitting a Scout-facing event correlating the failure to the reconciliation's `peerDataRequestSessionId`. If `remoteJid` cannot be determined, the system SHALL emit only the failure signal without attempting reconciliation.
+
+#### Scenario: Reconciliation triggered when remoteJid is available
+- **WHEN** a message's retries are exhausted and its `remoteJid` is present in the failure context
+- **THEN** the system triggers one `fetchMessageHistory` call for that conversation and emits an event containing the failure, the `remoteJid`, and the reconciliation's `peerDataRequestSessionId`
+
+#### Scenario: Alert-only fallback when remoteJid is unavailable
+- **WHEN** a message's retries are exhausted and no `remoteJid` can be determined from the failure context
+- **THEN** the system emits only the failure signal, without dispatching a reconciliation request
+
+#### Scenario: No repeated automatic reconciliation for the same failure
+- **WHEN** a reconciliation has already been dispatched for a given failure
+- **THEN** the system SHALL NOT retry or loop that reconciliation automatically
+
+### Requirement: Persist on-demand recovered messages regardless of disconnection history
+The system SHALL persist messages recovered via an `ON_DEMAND` `messaging-history.set` sync to the instance's message store regardless of the instance's `disconnectionAt` or `initialConnection` timestamps. The disconnection/initial-connection import floor SHALL continue to apply, unchanged, to non-`ON_DEMAND` syncTypes.
+
+#### Scenario: Recovered message older than the last disconnect is persisted
+- **WHEN** an `ON_DEMAND` `messaging-history.set` arrives with messages whose timestamp is at or before the instance's `disconnectionAt` (or `initialConnection`, if `disconnectionAt` is unset)
+- **THEN** those messages are persisted to the message store, subject to the same existing per-message validity checks (message/key/timestamp present, not already known)
+
+#### Scenario: Automatic reconnect sync is unaffected
+- **WHEN** a non-`ON_DEMAND` `messaging-history.set` arrives (e.g. `INITIAL` or `RECENT`, as happens automatically on reconnect)
+- **THEN** messages at or before `disconnectionAt`/`initialConnection` continue to be discarded, exactly as before this change
