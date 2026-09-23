@@ -2076,6 +2076,18 @@ export class BaileysStartupService extends ChannelStartupService {
             (messageRaw.message as any)?.protocolMessage ||
             (messageRaw.message as any)?.editedMessage?.message?.protocolMessage;
 
+          // Sync and other control protocols are not conversation messages.
+          if (
+            historyProtocolMessage &&
+            (!historyProtocolMessage.key?.id ||
+              (historyProtocolMessage.type !== proto.Message.ProtocolMessage.Type.REVOKE &&
+                historyProtocolMessage.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) ||
+              (historyProtocolMessage.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT &&
+                !historyProtocolMessage.editedMessage))
+          ) {
+            continue;
+          }
+
           if (historyProtocolMessage?.editedMessage) {
             const handledProtocolEdit = await this.createEditedMessageFromProtocolMessage(
               historyProtocolMessage,
@@ -2191,16 +2203,21 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const protocolMessage =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
-          const protocolOnlyMessage =
-            protocolMessage &&
-            !protocolMessage?.editedMessage &&
-            !Object.keys(received?.message || {}).some(
-              (key) => !['protocolMessage', 'messageContextInfo', 'senderKeyDistributionMessage'].includes(key),
-            );
-          const deletedProtocolMessage = protocolOnlyMessage ? protocolMessage : undefined;
-          const editedMessage = deletedProtocolMessage
-            ? undefined
-            : received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          const deletedProtocolMessage =
+            protocolMessage?.type === proto.Message.ProtocolMessage.Type.REVOKE && protocolMessage.key?.id
+              ? protocolMessage
+              : undefined;
+          const editedMessage =
+            protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT &&
+            protocolMessage.key?.id &&
+            protocolMessage.editedMessage
+              ? protocolMessage
+              : undefined;
+
+          // Connection sync notifications must not be persisted or emitted as edits/deletions.
+          if (protocolMessage && !deletedProtocolMessage && !editedMessage) {
+            continue;
+          }
 
           if (editedMessage) {
             // Dedup: multiple upsert events (notify + append) can arrive for the same edit envelope.
