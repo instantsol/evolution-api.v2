@@ -2378,13 +2378,30 @@ export class BaileysStartupService extends ChannelStartupService {
           const messageRaw = this.prepareMessage(received);
 
           if (deletedProtocolMessage) {
+            const originalMessage = await this.prismaRepository.message.findFirst({
+              where: {
+                instanceId: this.instanceId,
+                key: { path: ['id'], equals: deletedProtocolMessage.key.id },
+                messageType: { notIn: ['protocolMessage', 'editedMessage', 'REVOKE'] },
+              },
+              select: { key: true },
+            });
+            const originalKey = originalMessage?.key as ExtendedIMessageKey | undefined;
+            const originalRemoteJid =
+              originalKey?.remoteJid?.includes('@lid') && originalKey?.remoteJidAlt
+                ? originalKey.remoteJidAlt
+                : originalKey?.remoteJid;
+
             const deletedKey = {
               ...(deletedProtocolMessage.key || {}),
               id: deletedProtocolMessage.key?.id || received.key.id,
-              fromMe: deletedProtocolMessage.key?.fromMe ?? received.key.fromMe,
-              remoteJid: deletedProtocolMessage.key?.remoteJid || received.key.remoteJid,
-              ...(deletedProtocolMessage.key?.participant || received.key.participant
-                ? { participant: deletedProtocolMessage.key?.participant || received.key.participant }
+              fromMe: originalKey?.fromMe ?? deletedProtocolMessage.key?.fromMe ?? received.key.fromMe,
+              remoteJid: originalRemoteJid || received.key.remoteJid || deletedProtocolMessage.key?.remoteJid,
+              ...(originalKey?.participant || deletedProtocolMessage.key?.participant || received.key.participant
+                ? {
+                    participant:
+                      originalKey?.participant || deletedProtocolMessage.key?.participant || received.key.participant,
+                  }
                 : {}),
             };
 
@@ -3589,6 +3606,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (update.message === null && update.status === undefined) {
+            message.status = 'DELETED';
             this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
