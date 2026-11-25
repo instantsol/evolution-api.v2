@@ -4,16 +4,21 @@ import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { channelController } from '@api/server.module';
 import { Events, Integration } from '@api/types/wa.types';
+import { CacheEngine } from '@cache/cacheengine';
+import { LocalCache } from '@cache/localcache';
 import { CacheConf, Chatwoot, ConfigService, Database, DelInstance, ProviderSession } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
 import { NotFoundException } from '@exceptions';
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import { rmSync } from 'fs';
 import { join } from 'path';
 
 import { CacheService } from './cache.service';
+
+type InstanceCounts = Record<string, { Message: number; Contact: number; Chat: number }>;
 
 export class WAMonitoringService {
   constructor(
@@ -40,6 +45,11 @@ export class WAMonitoringService {
   private readonly logger = new Logger('WAMonitoringService');
   public readonly waInstances: Record<string, any> = {};
   private readonly delInstanceTimeouts: Record<string, NodeJS.Timeout> = {};
+  private readonly instanceCountsCache = new CacheService(
+    new CacheEngine(this.configService, 'instance-counts').getEngine() ||
+      new LocalCache(this.configService, 'instance-counts'),
+  );
+  private readonly instanceCountsRequests = new Map<string, Promise<InstanceCounts>>();
 
   private readonly providerSession: ProviderSession;
 
@@ -84,7 +94,50 @@ export class WAMonitoringService {
     }
   }
 
-  public async instanceInfo(instanceNames?: string[]): Promise<any> {
+  private async getInstanceCounts(instanceIds: string[]): Promise<InstanceCounts> {
+    if (instanceIds.length === 0) return {};
+
+    const ids = [...new Set(instanceIds)].sort();
+    const key = createHash('sha256')
+      .update(JSON.stringify([this.db.CONNECTION.CLIENT_NAME, ids]))
+      .digest('hex');
+    const cached = await this.instanceCountsCache.get(key);
+    if (cached?.counts && cached.freshUntil > Date.now()) return cached.counts;
+
+    let pending = this.instanceCountsRequests.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const startedAt = Date.now();
+        try {
+          const where = { instanceId: { in: ids } };
+          const [messages, contacts, chats] = await Promise.all([
+            this.prismaRepository.message.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+            this.prismaRepository.contact.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+            this.prismaRepository.chat.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+          ]);
+          const counts: InstanceCounts = Object.fromEntries(ids.map((id) => [id, { Message: 0, Contact: 0, Chat: 0 }]));
+          for (const row of messages) counts[row.instanceId].Message = row._count._all;
+          for (const row of contacts) counts[row.instanceId].Contact = row._count._all;
+          for (const row of chats) counts[row.instanceId].Chat = row._count._all;
+
+          await this.instanceCountsCache.set(key, { counts, freshUntil: Date.now() + 60000 }, 300);
+          this.logger.info(`instanceCounts instances=${ids.length} durationMs=${Date.now() - startedAt}`);
+          return counts;
+        } finally {
+          this.instanceCountsRequests.delete(key);
+        }
+      })();
+      this.instanceCountsRequests.set(key, pending);
+      if (cached?.counts) {
+        pending.catch((error) => this.logger.error({ message: 'Failed to refresh instance counts', error }));
+      }
+    }
+
+    // Keep the manager responsive while refreshing previously computed counts.
+    return cached?.counts || pending;
+  }
+
+  public async instanceInfo(instanceNames?: string[], includeCounts = true): Promise<any> {
     if (instanceNames && instanceNames.length > 0) {
       const inexistentInstances = instanceNames ? instanceNames.filter((instance) => !this.waInstances[instance]) : [];
 
@@ -107,6 +160,7 @@ export class WAMonitoringService {
           }
         : { clientName };
 
+    const startedAt = Date.now();
     const instances = await this.prismaRepository.instance.findMany({
       where,
       include: {
@@ -117,28 +171,43 @@ export class WAMonitoringService {
         Sqs: true,
         Websocket: true,
         Setting: true,
-        _count: {
-          select: {
-            Message: true,
-            Contact: true,
-            Chat: true,
-          },
-        },
       },
     });
+    const metadataMs = Date.now() - startedAt;
+    const counts = includeCounts ? await this.getInstanceCounts(instances.map((instance) => instance.id)) : undefined;
 
-    return instances;
+    const durationMs = Date.now() - startedAt;
+    const countsMs = durationMs - metadataMs;
+    const timing = `instanceInfo instances=${instances.length} includeCounts=${includeCounts} metadataMs=${metadataMs} countsMs=${countsMs} durationMs=${durationMs}`;
+    if (durationMs >= 30000) {
+      this.logger.error({
+        message: "instanceInfo exceeded the manager's 30-second timeout",
+        durationMs,
+        instances: instances.length,
+        includeCounts,
+        metadataMs,
+        countsMs,
+      });
+    } else {
+      this.logger.info(timing);
+    }
+
+    return includeCounts ? instances.map((instance) => ({ ...instance, _count: counts[instance.id] })) : instances;
   }
 
-  public async instanceInfoById(instanceId?: string, number?: string) {
+  public async instanceInfoById(instanceId?: string, number?: string, includeCounts = true) {
     let instanceName: string;
     if (instanceId) {
-      instanceName = await this.prismaRepository.instance.findFirst({ where: { id: instanceId } }).then((r) => r?.name);
+      instanceName = await this.prismaRepository.instance
+        .findFirst({ where: { id: instanceId }, select: { name: true } })
+        .then((r) => r?.name);
       if (!instanceName) {
         throw new NotFoundException(`Instance "${instanceId}" not found`);
       }
     } else if (number) {
-      instanceName = await this.prismaRepository.instance.findFirst({ where: { number } }).then((r) => r?.name);
+      instanceName = await this.prismaRepository.instance
+        .findFirst({ where: { number }, select: { name: true } })
+        .then((r) => r?.name);
       if (!instanceName) {
         throw new NotFoundException(`Instance "${number}" not found`);
       }
@@ -154,7 +223,7 @@ export class WAMonitoringService {
 
     const instanceNames = instanceName ? [instanceName] : null;
 
-    return this.instanceInfo(instanceNames);
+    return this.instanceInfo(instanceNames, includeCounts);
   }
 
   public async cleaningUp(instanceName: string) {

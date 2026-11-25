@@ -1,3 +1,4 @@
+import { notifyEvolutionError } from '@utils/notifyEvolutionError';
 import dayjs from 'dayjs';
 import fs from 'fs';
 
@@ -138,6 +139,7 @@ export class Logger {
 
   public error(value: any) {
     this.console(value, Type.ERROR);
+    notifyEvolutionError(value, this.context, this.instance);
   }
 
   public verbose(value: any) {
