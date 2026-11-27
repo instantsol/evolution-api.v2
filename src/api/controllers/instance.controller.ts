@@ -412,7 +412,7 @@ export class InstanceController {
     };
   }
 
-  public async fetchInstances({ instanceName, instanceId, number }: InstanceDto, key: string) {
+  public async fetchInstances({ instanceName, instanceId, number }: InstanceDto, key: string, includeCounts = true) {
     const env = this.configService.get<Auth>('AUTHENTICATION').API_KEY;
 
     if (env.KEY !== key) {
@@ -422,24 +422,25 @@ export class InstanceController {
           name: instanceName || undefined,
           id: instanceId || undefined,
         },
+        select: { name: true },
       });
 
       if (instancesByKey.length > 0) {
         const names = instancesByKey.map((instance) => instance.name);
 
-        return this.waMonitor.instanceInfo(names);
+        return this.waMonitor.instanceInfo(names, includeCounts);
       } else {
         throw new UnauthorizedException();
       }
     }
 
     if (instanceId || number) {
-      return this.waMonitor.instanceInfoById(instanceId, number);
+      return this.waMonitor.instanceInfoById(instanceId, number, includeCounts);
     }
 
     const instanceNames = instanceName ? [instanceName] : null;
 
-    return this.waMonitor.instanceInfo(instanceNames);
+    return this.waMonitor.instanceInfo(instanceNames, includeCounts);
   }
 
   public async setPresence({ instanceName }: InstanceDto, data: SetPresenceDto) {
@@ -484,6 +485,7 @@ export class InstanceController {
       await this.eventEmitter.emitAsync('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
     } catch (error) {
+      this.logger.error({ message: 'Failed to delete instance', instanceName, error });
       throw new BadRequestException(error.toString());
     }
   }

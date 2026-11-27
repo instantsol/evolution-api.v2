@@ -5,6 +5,7 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { SettingsService } from '@api/services/settings.service';
 import { Integration } from '@api/types/wa.types';
 import { Logger } from '@config/logger.config';
+import { Prisma } from '@prisma/client';
 import { calculateObjectSize } from 'bson';
 
 const logger = new Logger('KwikController');
@@ -803,6 +804,55 @@ export class KwikController {
     };
 
     if (body?.where?.id) where.remoteJid = body.where.id;
+
+    if (body?.includePreviewDetails && instances.length) {
+      const requestedLimit = Number(body.limit ?? 10);
+      const requestedSkip = Number(body.skip ?? 0);
+      const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 101) : 10;
+      const skip = Number.isFinite(requestedSkip) ? Math.max(Math.trunc(requestedSkip), 0) : 0;
+      const timestamp = Number(body.messageTimestamp);
+      const search = typeof body.search === 'string' ? body.search.trim().slice(0, 200) : '';
+      const searchPattern = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
+      const excludedPhones = Array.isArray(body.excludedPhones)
+        ? body.excludedPhones.filter((phone: any) => typeof phone === 'string')
+        : [];
+      const filters = [Prisma.sql`contact."instanceId" IN (${Prisma.join(instances.map((instance) => instance.id))})`];
+      if (where.remoteJid) filters.push(Prisma.sql`contact."remoteJid" = ${where.remoteJid}`);
+      if (Number.isFinite(timestamp)) {
+        filters.push(Prisma.sql`contact.lastmessagetimestamp >= ${Math.trunc(timestamp)}`);
+      }
+      if (excludedPhones.length) {
+        filters.push(Prisma.sql`split_part(contact."remoteJid", '@', 1) NOT IN (${Prisma.join(excludedPhones)})`);
+      }
+      if (search) {
+        const searchJids = Array.isArray(body.searchJids)
+          ? body.searchJids.filter((jid: any) => typeof jid === 'string')
+          : [];
+        filters.push(Prisma.sql`(contact."remoteJid" ILIKE ${searchPattern}
+          OR contact."pushName" ILIKE ${searchPattern} OR contact.kwik_contact_name ILIKE ${searchPattern}
+          ${searchJids.length ? Prisma.sql`OR contact."remoteJid" IN (${Prisma.join(searchJids)})` : Prisma.empty})`);
+      }
+
+      // Select the page using metadata before loading message bodies and keys.
+      return this.prismaRepository.$queryRaw(Prisma.sql`
+        SELECT page.id, page."remoteJid", page."pushName", page."profilePicUrl", page."instanceId",
+               page.kwik_contact_id, page.kwik_contact_name, page.instancename,
+               message.message, message."messageType" AS messagetype,
+               message."messageTimestamp" AS lastmessagetimestamp,
+               message.key->>'fromMe' AS fromme, message.key AS last_message_key
+        FROM (
+          SELECT contact.id, contact."remoteJid", contact."pushName", contact."profilePicUrl",
+                 contact."instanceId", contact.kwik_contact_id, contact.kwik_contact_name,
+                 contact.instancename, contact.last_message_id, contact.lastmessagetimestamp
+          FROM contact_with_last_message contact
+          WHERE ${Prisma.join(filters, ' AND ')}
+          ORDER BY contact.lastmessagetimestamp DESC, contact."remoteJid" ASC, contact.id ASC
+          LIMIT ${limit} OFFSET ${skip}
+        ) page
+        JOIN "Message" message ON message.id = page.last_message_id AND message."instanceId" = page."instanceId"
+        ORDER BY page.lastmessagetimestamp DESC, page."remoteJid" ASC, page.id ASC
+      `);
+    }
 
     const data = await this.prismaRepository.contactWithLastMessage.findMany({
       where: where,

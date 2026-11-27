@@ -76,8 +76,13 @@ async function bootstrap() {
     (err: Error, req: Request, res: Response, next: NextFunction) => {
       if (err) {
         const webhook = configService.get<Webhook>('WEBHOOK');
+        const errorWebhookEnabled = webhook.EVENTS.ERRORS && Boolean(webhook.EVENTS.ERRORS_WEBHOOK);
 
-        if (webhook.EVENTS.ERRORS_WEBHOOK && webhook.EVENTS.ERRORS_WEBHOOK != '' && webhook.EVENTS.ERRORS) {
+        if (!errorWebhookEnabled && (err['status'] || 500) >= 500) {
+          logger.error(err);
+        }
+
+        if (errorWebhookEnabled) {
           const tzoffset = new Date().getTimezoneOffset() * 60000; //offset in milliseconds
           const localISOTime = new Date(Date.now() - tzoffset).toISOString();
           const now = localISOTime;

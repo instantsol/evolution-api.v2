@@ -64,7 +64,7 @@ export class InstanceRouter extends RouterBroker {
           request: req,
           schema: null,
           ClassRef: InstanceDto,
-          execute: (instance) => instanceController.fetchInstances(instance, key),
+          execute: (instance) => instanceController.fetchInstances(instance, key, req.query.includeCounts !== 'false'),
         });
 
         // if (fullFetch > 0) { # TODO
